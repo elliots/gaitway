@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,7 +102,10 @@ func (c *Coordinator) RoundTrip(request *http.Request) (*http.Response, error) {
 		transformed, _ := json.Marshal(payload)
 		return c.send(request, transformed)
 	}
-	payload["stream"] = json.RawMessage("false")
+	// Claude Code's subscription endpoint reports usage on the streaming path.
+	// Buffer that stream for tool coordination, then restore the client's
+	// requested response shape below.
+	payload["stream"] = json.RawMessage("true")
 
 	usageTotals := make(map[string]int64)
 	for loop := 0; loop <= c.maxLoops; loop++ {
@@ -118,8 +122,8 @@ func (c *Coordinator) RoundTrip(request *http.Request) (*http.Response, error) {
 		if readErr != nil || int64(len(responseBody)) > c.maxBody {
 			return nil, fmt.Errorf("read tool-enabled upstream response: %w", readErr)
 		}
-		var message map[string]json.RawMessage
-		if err := json.Unmarshal(responseBody, &message); err != nil {
+		message, err := decodeUpstreamMessage(responseBody)
+		if err != nil {
 			return nil, fmt.Errorf("decode tool-enabled upstream response: %w", err)
 		}
 		accumulateUsage(usageTotals, message["usage"])
@@ -164,13 +168,150 @@ func (c *Coordinator) RoundTrip(request *http.Request) (*http.Response, error) {
 }
 
 func accumulateUsage(total map[string]int64, raw json.RawMessage) {
-	var current map[string]int64
+	var current map[string]json.RawMessage
 	if json.Unmarshal(raw, &current) != nil {
 		return
 	}
-	for name, value := range current {
-		total[name] += value
+	for name, rawValue := range current {
+		var value int64
+		if json.Unmarshal(rawValue, &value) == nil {
+			total[name] += value
+		}
 	}
+}
+
+type streamedBlock struct {
+	value   map[string]json.RawMessage
+	partial strings.Builder
+}
+
+func decodeUpstreamMessage(body []byte) (map[string]json.RawMessage, error) {
+	var message map[string]json.RawMessage
+	if json.Unmarshal(body, &message) == nil {
+		return message, nil
+	}
+	return decodeMessageSSE(body)
+}
+
+func decodeMessageSSE(body []byte) (map[string]json.RawMessage, error) {
+	frames := bytes.Split(bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n")), []byte("\n\n"))
+	var message map[string]json.RawMessage
+	blocks := make(map[int]*streamedBlock)
+	for _, frame := range frames {
+		data := sseData(frame)
+		if len(data) == 0 {
+			continue
+		}
+		var event map[string]json.RawMessage
+		if err := json.Unmarshal(data, &event); err != nil {
+			return nil, err
+		}
+		switch rawString(event["type"]) {
+		case "message_start":
+			if err := json.Unmarshal(event["message"], &message); err != nil {
+				return nil, err
+			}
+		case "content_block_start":
+			index := rawInt(event["index"])
+			var value map[string]json.RawMessage
+			if err := json.Unmarshal(event["content_block"], &value); err != nil {
+				return nil, err
+			}
+			blocks[index] = &streamedBlock{value: value}
+		case "content_block_delta":
+			block := blocks[rawInt(event["index"])]
+			if block == nil {
+				return nil, fmt.Errorf("content delta arrived before block start")
+			}
+			var delta map[string]json.RawMessage
+			if err := json.Unmarshal(event["delta"], &delta); err != nil {
+				return nil, err
+			}
+			switch rawString(delta["type"]) {
+			case "text_delta":
+				appendBlockString(block.value, "text", rawString(delta["text"]))
+			case "thinking_delta":
+				appendBlockString(block.value, "thinking", rawString(delta["thinking"]))
+			case "signature_delta":
+				appendBlockString(block.value, "signature", rawString(delta["signature"]))
+			case "input_json_delta":
+				block.partial.WriteString(rawString(delta["partial_json"]))
+			}
+		case "message_delta":
+			var delta map[string]json.RawMessage
+			if err := json.Unmarshal(event["delta"], &delta); err != nil {
+				return nil, err
+			}
+			for _, name := range []string{"stop_reason", "stop_sequence", "stop_details"} {
+				if value, ok := delta[name]; ok {
+					message[name] = value
+				}
+			}
+			message["usage"] = mergeJSONObjects(message["usage"], event["usage"])
+		}
+	}
+	if message == nil {
+		return nil, fmt.Errorf("stream contained no message_start event")
+	}
+	indexes := make([]int, 0, len(blocks))
+	for index := range blocks {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+	content := make([]map[string]json.RawMessage, 0, len(indexes))
+	for _, index := range indexes {
+		block := blocks[index]
+		if block.partial.Len() > 0 {
+			input := json.RawMessage(block.partial.String())
+			if !json.Valid(input) {
+				return nil, fmt.Errorf("tool input is not valid JSON")
+			}
+			block.value["input"] = input
+		}
+		content = append(content, block.value)
+	}
+	message["content"], _ = json.Marshal(content)
+	return message, nil
+}
+
+func sseData(frame []byte) []byte {
+	var result []byte
+	for _, line := range bytes.Split(frame, []byte("\n")) {
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		if len(result) > 0 {
+			result = append(result, '\n')
+		}
+		result = append(result, bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))...)
+	}
+	return result
+}
+
+func rawInt(raw json.RawMessage) int {
+	var value int
+	_ = json.Unmarshal(raw, &value)
+	return value
+}
+
+func appendBlockString(block map[string]json.RawMessage, name, addition string) {
+	encoded, _ := json.Marshal(rawString(block[name]) + addition)
+	block[name] = encoded
+}
+
+func mergeJSONObjects(base, update json.RawMessage) json.RawMessage {
+	var result map[string]json.RawMessage
+	if json.Unmarshal(base, &result) != nil {
+		result = make(map[string]json.RawMessage)
+	}
+	var additions map[string]json.RawMessage
+	if json.Unmarshal(update, &additions) == nil {
+		for name, value := range additions {
+			result[name] = value
+		}
+	}
+	encoded, _ := json.Marshal(result)
+	return encoded
 }
 
 type toolCall struct {

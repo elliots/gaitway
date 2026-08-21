@@ -52,8 +52,8 @@ func TestCoordinatorCompletesGatewayOnlyLoopWithoutTranscriptReceipt(t *testing.
 	transport.steps = []func(map[string]json.RawMessage) string{
 		func(payload map[string]json.RawMessage) string {
 			assertInjectedTool(t, payload)
-			if rawBool(payload["stream"]) {
-				t.Fatal("coordinated upstream request still streams")
+			if !rawBool(payload["stream"]) {
+				t.Fatal("coordinated upstream request does not stream")
 			}
 			return messageJSON(`[ {"type":"tool_use","id":"call-1","name":"gaitway__test","input":{"q":1}} ]`, "tool_use")
 		},
@@ -175,6 +175,50 @@ func TestCoordinatorConvertsToolResponseToSSE(t *testing.T) {
 	body, _ := io.ReadAll(response.Body)
 	if response.Header.Get("Content-Type") != "text/event-stream" || !strings.Contains(string(body), `"text":"hello"`) || !strings.Contains(string(body), `"type":"text_delta"`) || !strings.Contains(string(body), "event: message_stop") {
 		t.Fatalf("invalid synthetic stream: %s", body)
+	}
+}
+
+func TestDecodeMessageSSEPreservesUsageAndToolInput(t *testing.T) {
+	body := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg-1","type":"message","role":"assistant","content":[],"model":"claude-test","stop_reason":null,"usage":{"input_tokens":3,"cache_read_input_tokens":5,"output_tokens":0,"output_tokens_details":{"thinking_tokens":0}}}}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"gaitway__test","input":{}}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"q\":1}"}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":7}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+	message, err := decodeUpstreamMessage([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var usage map[string]json.RawMessage
+	_ = json.Unmarshal(message["usage"], &usage)
+	if rawInt(usage["input_tokens"]) != 3 || rawInt(usage["cache_read_input_tokens"]) != 5 || rawInt(usage["output_tokens"]) != 7 {
+		t.Fatalf("usage was not reconstructed: %s", message["usage"])
+	}
+	blocks, _ := decodeBlocks(message["content"])
+	if len(blocks) != 1 || string(blocks[0]["input"]) != `{"q":1}` {
+		t.Fatalf("tool input was not reconstructed: %s", message["content"])
+	}
+}
+
+func TestAccumulateUsageSkipsNestedMetadata(t *testing.T) {
+	total := make(map[string]int64)
+	accumulateUsage(total, json.RawMessage(`{"input_tokens":3,"output_tokens":7,"output_tokens_details":{"thinking_tokens":2}}`))
+	if total["input_tokens"] != 3 || total["output_tokens"] != 7 {
+		t.Fatalf("numeric usage was lost: %+v", total)
 	}
 }
 
