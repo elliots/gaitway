@@ -16,9 +16,15 @@ import (
 
 func TestStreamingMessagesPassesThroughAndActivatesOnce(t *testing.T) {
 	var attempts atomic.Int32
+	var firstEncoding, secondEncoding string
 	requestBody := []byte(`{"model":"claude-test","unknown":{"future":true}}`)
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		attempts.Add(1)
+		attempt := attempts.Add(1)
+		if attempt == 1 {
+			firstEncoding = request.Header.Get("Accept-Encoding")
+		} else {
+			secondEncoding = request.Header.Get("Accept-Encoding")
+		}
 		if request.Method != http.MethodPost || request.URL.RequestURI() != "/v1/messages?beta=true" {
 			t.Errorf("unexpected upstream request: %s %s", request.Method, request.URL.RequestURI())
 		}
@@ -41,6 +47,7 @@ func TestStreamingMessagesPassesThroughAndActivatesOnce(t *testing.T) {
 	for run := range 2 {
 		request, _ := http.NewRequest(http.MethodPost, gateway.URL+"/v1/messages?beta=true", bytes.NewReader(requestBody))
 		request.Header.Set("Authorization", "Bearer secret-canary")
+		request.Header.Set("Accept-Encoding", "gzip")
 		request.Header.Set("x-claude-code-session-id", "11111111-1111-1111-1111-111111111111")
 		response, err := http.DefaultClient.Do(request)
 		if err != nil {
@@ -61,6 +68,9 @@ func TestStreamingMessagesPassesThroughAndActivatesOnce(t *testing.T) {
 	}
 	if attempts.Load() != 2 {
 		t.Fatalf("upstream attempts = %d, want 2", attempts.Load())
+	}
+	if firstEncoding != "" || secondEncoding != "gzip" {
+		t.Fatalf("encoding negotiation: first=%q second=%q", firstEncoding, secondEncoding)
 	}
 }
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"log/slog"
 	"net"
@@ -9,11 +10,18 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
+	"gaitway/internal/archive"
+	"gaitway/internal/audit"
 	"gaitway/internal/banner"
+	"gaitway/internal/control"
+	"gaitway/internal/identity"
+	"gaitway/internal/plugin"
 	"gaitway/internal/proxy"
 )
 
@@ -28,6 +36,12 @@ type config struct {
 	maxSessions      int
 	maxSSELineBytes  int
 	maxSSEFrameBytes int
+	dataDir          string
+	secretAction     plugin.Action
+	approvedModels   []string
+	budgetWindow     time.Duration
+	budgetWarning    int64
+	budgetHard       int64
 }
 
 func main() {
@@ -40,12 +54,43 @@ func main() {
 
 	registry := banner.NewRegistry(settings.maxSessions)
 	transformer := banner.NewTransformer(settings.activation, registry, settings.maxSSELineBytes, settings.maxSSEFrameBytes)
+	objects, err := archive.NewFilesystem(filepath.Join(settings.dataDir, "content"))
+	if err != nil {
+		logger.Error("cannot open content archive", "error", err)
+		os.Exit(2)
+	}
+	events, err := audit.NewJSONLStore(filepath.Join(settings.dataDir, "audit.jsonl"))
+	if err != nil {
+		logger.Error("cannot open audit store", "error", err)
+		os.Exit(2)
+	}
+	identityKey, err := loadOrCreateKey(filepath.Join(settings.dataDir, "identity-hmac.key"))
+	if err != nil {
+		logger.Error("cannot load identity key", "error", err)
+		os.Exit(2)
+	}
+	resolver, err := identity.NewResolver(identityKey)
+	if err != nil {
+		logger.Error("cannot create identity resolver", "error", err)
+		os.Exit(2)
+	}
+	policies, err := plugin.NewEngine(100*time.Millisecond,
+		plugin.NewSecretScanner(settings.secretAction),
+		plugin.NewModelPolicy(settings.approvedModels),
+		plugin.NewBudgetPolicy(settings.budgetWindow, settings.budgetWarning, settings.budgetHard),
+	)
+	if err != nil {
+		logger.Error("cannot create policy engine", "error", err)
+		os.Exit(2)
+	}
+	controller := control.NewService(objects, events, resolver, policies, settings.maxRequestBytes)
 	handler, err := proxy.NewHandler(proxy.Config{
 		Upstream:        settings.upstream,
 		Banner:          transformer,
 		MaxRequestBytes: settings.maxRequestBytes,
 		MaxSessionBytes: settings.maxSessionBytes,
 		Logger:          logger,
+		Hooks:           controller,
 	})
 	if err != nil {
 		logger.Error("cannot create gateway", "error", err)
@@ -86,6 +131,10 @@ func loadConfig() (config, error) {
 		maxSessions:      10_000,
 		maxSSELineBytes:  1 << 20,
 		maxSSEFrameBytes: 8 << 20,
+		dataDir:          envOr("GAITWAY_DATA_DIR", "./data"),
+		secretAction:     plugin.Action(envOr("GAITWAY_SECRET_ACTION", "reject")),
+		approvedModels:   splitList(os.Getenv("GAITWAY_APPROVED_MODELS")),
+		budgetWindow:     time.Hour,
 	}
 	if activation, exists := os.LookupEnv("GAITWAY_ACTIVATION_MESSAGE"); exists {
 		result.activation = activation
@@ -126,6 +175,17 @@ func loadConfig() (config, error) {
 	if result.maxSSEFrameBytes, intErr = positiveInt("GAITWAY_MAX_SSE_FRAME_BYTES", result.maxSSEFrameBytes); intErr != nil {
 		return config{}, intErr
 	}
+	if raw := os.Getenv("GAITWAY_BUDGET_WINDOW"); raw != "" {
+		if result.budgetWindow, err = time.ParseDuration(raw); err != nil || result.budgetWindow <= 0 {
+			return config{}, fmt.Errorf("GAITWAY_BUDGET_WINDOW must be a positive duration")
+		}
+	}
+	if result.budgetWarning, err = nonNegativeInt64("GAITWAY_BUDGET_WARNING_UNITS", 0); err != nil {
+		return config{}, err
+	}
+	if result.budgetHard, err = nonNegativeInt64("GAITWAY_BUDGET_HARD_UNITS", 0); err != nil {
+		return config{}, err
+	}
 	return result, nil
 }
 
@@ -151,4 +211,69 @@ func positiveInt64(name string, fallback int64) (int64, error) {
 		return 0, fmt.Errorf("%s must be a positive integer", name)
 	}
 	return value, nil
+}
+
+func nonNegativeInt64(name string, fallback int64) (int64, error) {
+	raw, exists := os.LookupEnv(name)
+	if !exists {
+		return fallback, nil
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative integer", name)
+	}
+	return value, nil
+}
+
+func splitList(raw string) []string {
+	var result []string
+	for _, item := range strings.Split(raw, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+func loadOrCreateKey(path string) ([]byte, error) {
+	if key, err := os.ReadFile(path); err == nil {
+		return key, nil
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".identity-key-*")
+	if err != nil {
+		return nil, err
+	}
+	temporaryName := temporary.Name()
+	defer os.Remove(temporaryName)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return nil, err
+	}
+	if _, err := temporary.Write(key); err != nil {
+		_ = temporary.Close()
+		return nil, err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return nil, err
+	}
+	if err := temporary.Close(); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(temporaryName, path); err != nil {
+		if existing, readErr := os.ReadFile(path); readErr == nil {
+			return existing, nil
+		}
+		return nil, err
+	}
+	return key, nil
 }

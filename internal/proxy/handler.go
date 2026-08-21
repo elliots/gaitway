@@ -21,6 +21,13 @@ type Config struct {
 	MaxRequestBytes int64
 	MaxSessionBytes int
 	Logger          *slog.Logger
+	Hooks           Hooks
+}
+
+type Hooks interface {
+	Prepare(http.ResponseWriter, *http.Request) (*http.Request, bool)
+	WrapResponse(*http.Request, *http.Response)
+	Fail(*http.Request, error)
 }
 
 type claimKey struct{}
@@ -50,6 +57,12 @@ func NewHandler(config Config) (http.Handler, error) {
 			request.SetURL(config.Upstream)
 			request.Out.URL.RawQuery = request.In.URL.RawQuery
 			request.Out.GetBody = nil
+			// The activation seam cannot safely mutate a compressed body. Ask the
+			// upstream for identity encoding only on the one claimed response;
+			// passive requests retain the client's original encoding negotiation.
+			if claim, _ := request.In.Context().Value(claimKey{}).(string); claim != "" {
+				request.Out.Header.Del("Accept-Encoding")
+			}
 		},
 		Transport:     config.Transport,
 		FlushInterval: -1,
@@ -58,12 +71,18 @@ func NewHandler(config Config) (http.Handler, error) {
 			if claim != "" {
 				config.Banner.TransformResponse(response, claim)
 			}
+			if config.Hooks != nil {
+				config.Hooks.WrapResponse(response.Request, response)
+			}
 			return nil
 		},
 		ErrorHandler: func(writer http.ResponseWriter, request *http.Request, err error) {
 			claim, _ := request.Context().Value(claimKey{}).(string)
 			if claim != "" {
 				config.Banner.Release(claim)
+			}
+			if config.Hooks != nil {
+				config.Hooks.Fail(request, err)
 			}
 			if errors.Is(err, context.Canceled) || errors.Is(request.Context().Err(), context.Canceled) {
 				return
@@ -88,6 +107,13 @@ func NewHandler(config Config) (http.Handler, error) {
 			return
 		}
 		request.Body = http.MaxBytesReader(writer, request.Body, config.MaxRequestBytes)
+		if config.Hooks != nil {
+			var ok bool
+			request, ok = config.Hooks.Prepare(writer, request)
+			if !ok {
+				return
+			}
+		}
 		if request.URL.Path == "/v1/messages" && config.Banner != nil {
 			if session, ok := safeSession(request.Header.Values("x-claude-code-session-id"), config.MaxSessionBytes); ok && config.Banner.Claim(session) {
 				request = request.WithContext(context.WithValue(request.Context(), claimKey{}, session))
