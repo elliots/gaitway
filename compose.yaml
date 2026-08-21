@@ -1,0 +1,89 @@
+services:
+  postgres:
+    image: postgres:18.4-bookworm
+    environment:
+      POSTGRES_DB: gaitway
+      POSTGRES_USER: gaitway
+      POSTGRES_PASSWORD: gaitway-local-only
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    ports:
+      - 127.0.0.1:5432:5432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gaitway -d gaitway"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  gaitway:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://gaitway:gaitway-local-only@postgres:5432/gaitway?sslmode=disable
+      GAITWAY_LISTEN_ADDR: 0.0.0.0:8080
+      GAITWAY_ADMIN_ADDR: 0.0.0.0:8081
+      GAITWAY_DATA_DIR: /var/lib/gaitway
+      GAITWAY_SECRET_ACTION: reject
+      GAITWAY_OTEL_ENDPOINT: http://otel-collector:4318
+      GAITWAY_ACTIVATION_MESSAGE: ${GAITWAY_ACTIVATION_MESSAGE:-*** Gaitway Active ***}
+      GAITWAY_IDENTITY_PROBE: ${GAITWAY_IDENTITY_PROBE:-true}
+      GAITWAY_APPROVED_MODELS: ${GAITWAY_APPROVED_MODELS:-}
+      GAITWAY_BUDGET_WINDOW: ${GAITWAY_BUDGET_WINDOW:-1h}
+      GAITWAY_BUDGET_WARNING_UNITS: ${GAITWAY_BUDGET_WARNING_UNITS:-0}
+      GAITWAY_BUDGET_HARD_UNITS: ${GAITWAY_BUDGET_HARD_UNITS:-0}
+      GAITWAY_TOOLS_ENABLED: ${GAITWAY_TOOLS_ENABLED:-false}
+      GAITWAY_HTTP_TOOL_HOSTS: ${GAITWAY_HTTP_TOOL_HOSTS:-}
+      GAITWAY_HTTP_TOOL_PATHS: ${GAITWAY_HTTP_TOOL_PATHS:-}
+      GAITWAY_HTTP_TOOL_BEARER_TOKEN: ${GAITWAY_HTTP_TOOL_BEARER_TOKEN:-}
+      GAITWAY_HTTP_TOOL_ALLOW_PRIVATE: ${GAITWAY_HTTP_TOOL_ALLOW_PRIVATE:-false}
+      GAITWAY_HTTP_TOOL_TIMEOUT: ${GAITWAY_HTTP_TOOL_TIMEOUT:-10s}
+      GAITWAY_HTTP_TOOL_MAX_RESULT_BYTES: ${GAITWAY_HTTP_TOOL_MAX_RESULT_BYTES:-1048576}
+      GAITWAY_ARCHIVE_BACKEND: ${GAITWAY_ARCHIVE_BACKEND:-filesystem}
+      GAITWAY_S3_ENDPOINT: ${GAITWAY_S3_ENDPOINT:-http://minio:9000}
+      GAITWAY_S3_BUCKET: ${GAITWAY_S3_BUCKET:-gaitway}
+      GAITWAY_S3_ACCESS_KEY: ${GAITWAY_S3_ACCESS_KEY:-gaitway-local}
+      GAITWAY_S3_SECRET_KEY: ${GAITWAY_S3_SECRET_KEY:-gaitway-local-secret}
+      GAITWAY_S3_ALLOW_HTTP: ${GAITWAY_S3_ALLOW_HTTP:-true}
+      GAITWAY_S3_CREATE_BUCKET: ${GAITWAY_S3_CREATE_BUCKET:-true}
+    volumes:
+      - gaitway-data:/var/lib/gaitway
+    ports:
+      - 127.0.0.1:8080:8080
+      - 127.0.0.1:8081:8081
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    read_only: true
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.159.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    profiles: ["s3"]
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: ${GAITWAY_S3_ACCESS_KEY:-gaitway-local}
+      MINIO_ROOT_PASSWORD: ${GAITWAY_S3_SECRET_KEY:-gaitway-local-secret}
+    volumes:
+      - minio-data:/data
+    ports:
+      - 127.0.0.1:9000:9000
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  gaitway-data:
+  minio-data:

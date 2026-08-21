@@ -16,8 +16,11 @@ type BudgetPolicy struct {
 }
 
 type budgetWindow struct {
-	started  time.Time
-	reserved int64
+	started      time.Time
+	used         int64
+	reserved     int64
+	reservations map[string]int64
+	acknowledged bool
 }
 
 func NewBudgetPolicy(window time.Duration, warning, hard int64) *BudgetPolicy {
@@ -42,17 +45,45 @@ func (b *BudgetPolicy) Evaluate(_ context.Context, request Request) Decision {
 	defer b.mu.Unlock()
 	entry := b.usage[request.Principal]
 	if entry.started.IsZero() || request.Now.Sub(entry.started) >= b.window {
-		entry = budgetWindow{started: request.Now}
+		entry = budgetWindow{started: request.Now, reservations: make(map[string]int64)}
 	}
-	if entry.reserved+units > b.hard {
+	if entry.used+entry.reserved+units > b.hard {
 		return Decision{Action: Reject, Status: 429, Code: "usage_limit", Message: "usage hard limit reached", Findings: []Finding{{Plugin: b.Name(), Rule: "hard-cap", Message: "request reservation rejected"}}}
 	}
 	entry.reserved += units
+	if request.Acknowledged {
+		entry.acknowledged = true
+	}
+	if request.ID != "" {
+		entry.reservations[request.ID] = units
+	}
 	b.usage[request.Principal] = entry
-	if b.warning > 0 && entry.reserved >= b.warning {
+	if b.warning > 0 && entry.used+entry.reserved >= b.warning && !entry.acknowledged {
 		return Decision{Action: Warn, Code: "usage_warning", Message: "usage warning threshold reached", Findings: []Finding{{Plugin: b.Name(), Rule: "warning", Message: "usage warning threshold reached"}}}
 	}
 	return Decision{Action: Allow}
+}
+
+func (b *BudgetPolicy) Reconcile(principal, requestID string, actual int64, completed bool, now time.Time) {
+	if requestID == "" || b.hard == 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	entry, ok := b.usage[principal]
+	if !ok || (!entry.started.IsZero() && now.Sub(entry.started) >= b.window) {
+		return
+	}
+	estimate, ok := entry.reservations[requestID]
+	if !ok {
+		return
+	}
+	delete(entry.reservations, requestID)
+	entry.reserved -= estimate
+	if completed && actual > 0 {
+		entry.used += actual
+	}
+	b.usage[principal] = entry
 }
 
 func estimatedUnits(body []byte) int64 {

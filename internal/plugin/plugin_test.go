@@ -9,6 +9,12 @@ import (
 	"time"
 )
 
+type panicPlugin struct{}
+
+func (panicPlugin) Name() string                               { return "panic" }
+func (panicPlugin) Validate() error                            { return nil }
+func (panicPlugin) Evaluate(context.Context, Request) Decision { panic("boom") }
+
 func TestSecretScannerRejectsAndMasks(t *testing.T) {
 	secret := "AKIA1234567890ABCDEF"
 	decision := NewSecretScanner(Reject).Evaluate(context.Background(), Request{Body: []byte("use " + secret)})
@@ -47,5 +53,53 @@ func TestBudgetReservationsAreAtomic(t *testing.T) {
 	group.Wait()
 	if allowed.Load() != 10 {
 		t.Fatalf("allowed %d reservations, want 10", allowed.Load())
+	}
+}
+
+func TestBudgetReconcilesEstimateToProviderUsage(t *testing.T) {
+	policy := NewBudgetPolicy(time.Hour, 0, 20)
+	now := time.Now()
+	request := Request{ID: "one", Principal: "p", Route: "messages", Body: []byte(strings.Repeat("x", 36)), Now: now}
+	if decision := policy.Evaluate(context.Background(), request); decision.Action != Allow {
+		t.Fatalf("initial reservation failed: %+v", decision)
+	}
+	policy.Reconcile("p", "one", 3, true, now)
+	request.ID = "a"
+	if decision := policy.Evaluate(context.Background(), request); decision.Action != Allow {
+		t.Fatalf("reconciled capacity was not released: %+v", decision)
+	}
+	policy.Reconcile("p", "a", 0, false, now)
+	request.ID = "last"
+	if decision := policy.Evaluate(context.Background(), request); decision.Action != Allow {
+		t.Fatalf("failed request reservation was not released: %+v", decision)
+	}
+}
+
+func TestPluginPanicFailsClosed(t *testing.T) {
+	engine, _ := NewEngine(time.Second, panicPlugin{})
+	decision := engine.Evaluate(context.Background(), Request{})
+	if decision.Action != Reject || decision.Code != "plugin_failure" {
+		t.Fatalf("plugin panic did not fail closed: %+v", decision)
+	}
+}
+
+func TestBudgetAcknowledgementLastsForWindow(t *testing.T) {
+	policy := NewBudgetPolicy(time.Hour, 1, 1000)
+	now := time.Now()
+	first := Request{ID: "one", Principal: "p", Route: "messages", Body: []byte("x"), Now: now}
+	if decision := policy.Evaluate(context.Background(), first); decision.Action != Warn {
+		t.Fatalf("warning was not raised: %+v", decision)
+	}
+	policy.Reconcile("p", "one", 0, false, now)
+	first.ID = "two"
+	first.Acknowledged = true
+	if decision := policy.Evaluate(context.Background(), first); decision.Action != Allow {
+		t.Fatalf("acknowledged request was not allowed: %+v", decision)
+	}
+	policy.Reconcile("p", "two", 0, false, now)
+	first.ID = "three"
+	first.Acknowledged = false
+	if decision := policy.Evaluate(context.Background(), first); decision.Action != Allow {
+		t.Fatalf("acknowledgement did not last for window: %+v", decision)
 	}
 }

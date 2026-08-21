@@ -71,6 +71,9 @@ func NewHandler(config Config) (http.Handler, error) {
 			if claim != "" {
 				config.Banner.TransformResponse(response, claim)
 			}
+			// Never expose coordinator-only response metadata to clients, including
+			// sessions whose activation marker was already emitted.
+			response.Header.Del("X-Gaitway-Defer-Activation")
 			if config.Hooks != nil {
 				config.Hooks.WrapResponse(response.Request, response)
 			}

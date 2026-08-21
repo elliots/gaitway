@@ -15,11 +15,18 @@ const (
 )
 
 type Request struct {
-	Principal string
-	Route     string
-	Model     string
-	Body      []byte
-	Now       time.Time
+	ID           string
+	Principal    string
+	Session      string
+	Route        string
+	Model        string
+	Body         []byte
+	Now          time.Time
+	Acknowledged bool
+}
+
+type UsageReconciler interface {
+	Reconcile(principal, requestID string, actual int64, completed bool, now time.Time)
 }
 
 type Finding struct {
@@ -82,17 +89,31 @@ func (e *Engine) Evaluate(ctx context.Context, request Request) Decision {
 	return combined
 }
 
-func (e *Engine) evaluateOne(ctx context.Context, item RequestPlugin, request Request) (result Decision) {
-	defer func() {
-		if recover() != nil {
-			result = Decision{Action: Reject, Status: 500, Code: "plugin_failure", Message: "request policy failed closed"}
+func (e *Engine) Reconcile(principal, requestID string, actual int64, completed bool, now time.Time) {
+	for _, item := range e.plugins {
+		if reconciler, ok := item.(UsageReconciler); ok {
+			reconciler.Reconcile(principal, requestID, actual, completed, now)
 		}
-	}()
+	}
+}
+
+func (e *Engine) evaluateOne(ctx context.Context, item RequestPlugin, request Request) Decision {
 	pluginContext, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
 	type response struct{ decision Decision }
 	done := make(chan response, 1)
-	go func() { done <- response{decision: item.Evaluate(pluginContext, request)} }()
+	go func() {
+		result := Decision{}
+		func() {
+			defer func() {
+				if recover() != nil {
+					result = Decision{Action: Reject, Status: 500, Code: "plugin_failure", Message: "request policy failed closed"}
+				}
+			}()
+			result = item.Evaluate(pluginContext, request)
+		}()
+		done <- response{decision: result}
+	}()
 	select {
 	case output := <-done:
 		return output.decision

@@ -76,6 +76,15 @@ func (f *Filesystem) Put(ctx context.Context, kind string, body []byte) (Object,
 	if err := os.Rename(temporaryName, name); err != nil {
 		return Object{}, fmt.Errorf("publish archive object: %w", err)
 	}
+	directoryHandle, err := os.Open(directory)
+	if err != nil {
+		return Object{}, fmt.Errorf("open archive directory: %w", err)
+	}
+	err = directoryHandle.Sync()
+	_ = directoryHandle.Close()
+	if err != nil {
+		return Object{}, fmt.Errorf("sync archive directory: %w", err)
+	}
 	return Object{Ref: ref, SHA256: hex.EncodeToString(digest[:]), Size: int64(len(body)), Kind: kind, CreatedAt: created}, nil
 }
 
@@ -83,13 +92,8 @@ func (f *Filesystem) Read(ctx context.Context, ref string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if len(ref) != 32 {
+	if !validRef(ref) {
 		return nil, fmt.Errorf("invalid object reference")
-	}
-	for _, char := range ref {
-		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
-			return nil, fmt.Errorf("invalid object reference")
-		}
 	}
 	var match string
 	err := filepath.WalkDir(f.root, func(path string, entry os.DirEntry, err error) error {

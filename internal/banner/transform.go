@@ -13,6 +13,7 @@ import (
 )
 
 const defaultMaxJSONBytes = 8 << 20
+const deferActivationHeader = "X-Gaitway-Defer-Activation"
 
 // Transformer injects a static marker into the first text-bearing response of
 // a claimed Claude session. All other responses remain untouched.
@@ -49,6 +50,12 @@ func (t *Transformer) Release(session string) {
 // TransformResponse mutates only eligible successful identity-encoded bodies.
 // It returns true when the response is or may be transformed asynchronously.
 func (t *Transformer) TransformResponse(resp *http.Response, session string) bool {
+	deferActivation := resp.Header.Get(deferActivationHeader) == "1"
+	resp.Header.Del(deferActivationHeader)
+	if deferActivation {
+		t.Release(session)
+		return false
+	}
 	if !t.Enabled() || session == "" || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		t.Release(session)
 		return false

@@ -11,29 +11,35 @@ import (
 )
 
 type Event struct {
-	ID           string    `json:"id"`
-	RequestID    string    `json:"request_id"`
-	Type         string    `json:"type"`
-	Time         time.Time `json:"time"`
-	Principal    string    `json:"principal,omitempty"`
-	Session      string    `json:"session,omitempty"`
-	Agent        string    `json:"agent,omitempty"`
-	ParentAgent  string    `json:"parent_agent,omitempty"`
-	Route        string    `json:"route,omitempty"`
-	Model        string    `json:"model,omitempty"`
-	Status       int       `json:"status,omitempty"`
-	Outcome      string    `json:"outcome,omitempty"`
-	InputTokens  int64     `json:"input_tokens,omitempty"`
-	OutputTokens int64     `json:"output_tokens,omitempty"`
-	CacheRead    int64     `json:"cache_read_tokens,omitempty"`
-	CacheWrite   int64     `json:"cache_write_tokens,omitempty"`
-	LatencyMS    int64     `json:"latency_ms,omitempty"`
-	ContentRef   string    `json:"content_ref,omitempty"`
-	ContentSHA   string    `json:"content_sha256,omitempty"`
-	ContentSize  int64     `json:"content_size,omitempty"`
-	Policy       string    `json:"policy,omitempty"`
-	Rule         string    `json:"rule,omitempty"`
-	Finding      string    `json:"finding,omitempty"`
+	ID             string    `json:"id"`
+	RequestID      string    `json:"request_id"`
+	Type           string    `json:"type"`
+	Time           time.Time `json:"time"`
+	Principal      string    `json:"principal,omitempty"`
+	Session        string    `json:"session,omitempty"`
+	Agent          string    `json:"agent,omitempty"`
+	ParentAgent    string    `json:"parent_agent,omitempty"`
+	Username       string    `json:"username,omitempty"`
+	Hostname       string    `json:"hostname,omitempty"`
+	Assurance      string    `json:"identity_assurance,omitempty"`
+	Route          string    `json:"route,omitempty"`
+	Model          string    `json:"model,omitempty"`
+	Status         int       `json:"status,omitempty"`
+	Outcome        string    `json:"outcome,omitempty"`
+	InputTokens    int64     `json:"input_tokens,omitempty"`
+	OutputTokens   int64     `json:"output_tokens,omitempty"`
+	CacheRead      int64     `json:"cache_read_tokens,omitempty"`
+	CacheWrite     int64     `json:"cache_write_tokens,omitempty"`
+	LatencyMS      int64     `json:"latency_ms,omitempty"`
+	ContentRef     string    `json:"content_ref,omitempty"`
+	ContentSHA     string    `json:"content_sha256,omitempty"`
+	ContentSize    int64     `json:"content_size,omitempty"`
+	Policy         string    `json:"policy,omitempty"`
+	Rule           string    `json:"rule,omitempty"`
+	Finding        string    `json:"finding,omitempty"`
+	ToolName       string    `json:"tool_name,omitempty"`
+	ToolUseID      string    `json:"tool_use_id,omitempty"`
+	Classification string    `json:"classification,omitempty"`
 }
 
 type Store interface {
@@ -82,7 +88,9 @@ func (s *JSONLStore) List(ctx context.Context, limit int) ([]Event, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
+	s.mu.Lock()
 	data, err := os.ReadFile(s.path)
+	s.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}

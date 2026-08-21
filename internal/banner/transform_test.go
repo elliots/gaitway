@@ -90,3 +90,28 @@ func TestToolOnlyResponseReleasesClaim(t *testing.T) {
 		t.Fatal("tool-only response did not release claim")
 	}
 }
+
+func TestDeferredResponseReleasesClaimWithoutLeakingHeader(t *testing.T) {
+	registry := NewRegistry(10)
+	transformer := NewTransformer("active", registry, 1<<20, 8<<20)
+	if !transformer.Claim("session") {
+		t.Fatal("claim failed")
+	}
+	response := &http.Response{
+		StatusCode: 200,
+		Header: http.Header{
+			"Content-Type":        {"text/event-stream"},
+			deferActivationHeader: {"1"},
+		},
+		Body: io.NopCloser(strings.NewReader(testStream)),
+	}
+	if transformer.TransformResponse(response, "session") {
+		t.Fatal("deferred response was transformed")
+	}
+	if response.Header.Get(deferActivationHeader) != "" {
+		t.Fatal("internal activation header leaked")
+	}
+	if !transformer.Claim("session") {
+		t.Fatal("deferred response did not release claim")
+	}
+}

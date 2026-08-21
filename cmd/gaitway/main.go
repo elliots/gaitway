@@ -20,9 +20,13 @@ import (
 	"gaitway/internal/audit"
 	"gaitway/internal/banner"
 	"gaitway/internal/control"
+	"gaitway/internal/dashboard"
+	"gaitway/internal/gatewaytool"
 	"gaitway/internal/identity"
 	"gaitway/internal/plugin"
+	postgresstore "gaitway/internal/postgres"
 	"gaitway/internal/proxy"
+	"gaitway/internal/telemetry"
 )
 
 const defaultActivation = "*** Gaitway Active ***"
@@ -42,28 +46,85 @@ type config struct {
 	budgetWindow     time.Duration
 	budgetWarning    int64
 	budgetHard       int64
+	adminAddr        string
+	databaseURL      string
+	otelEndpoint     string
+	toolsEnabled     bool
+	toolHosts        []string
+	toolPaths        []string
+	toolBearerToken  string
+	toolAllowPrivate bool
+	toolTimeout      time.Duration
+	toolMaxBytes     int64
+	archiveBackend   string
+	s3Endpoint       string
+	s3Region         string
+	s3Bucket         string
+	s3Prefix         string
+	s3AccessKey      string
+	s3SecretKey      string
+	s3SessionToken   string
+	s3AllowHTTP      bool
+	s3CreateBucket   bool
+	identityProbe    bool
 }
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+	localLogs := slog.NewJSONHandler(os.Stderr, nil)
+	logger := slog.New(localLogs)
 	settings, err := loadConfig()
 	if err != nil {
 		logger.Error("invalid configuration", "error", err)
 		os.Exit(2)
 	}
+	telemetryRecorder, telemetryLogger, shutdownTelemetry, err := telemetry.New(context.Background(), settings.otelEndpoint, localLogs)
+	if err != nil {
+		logger.Error("cannot configure telemetry", "error", err)
+		os.Exit(2)
+	}
+	logger = telemetryLogger
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shutdownTelemetry(ctx)
+	}()
 
 	registry := banner.NewRegistry(settings.maxSessions)
 	transformer := banner.NewTransformer(settings.activation, registry, settings.maxSSELineBytes, settings.maxSSEFrameBytes)
-	objects, err := archive.NewFilesystem(filepath.Join(settings.dataDir, "content"))
+	var objects archive.Store
+	if settings.archiveBackend == "s3" {
+		objects, err = archive.NewS3(context.Background(), archive.S3Config{
+			Endpoint: settings.s3Endpoint, Region: settings.s3Region, Bucket: settings.s3Bucket, Prefix: settings.s3Prefix,
+			AccessKey: settings.s3AccessKey, SecretKey: settings.s3SecretKey, SessionToken: settings.s3SessionToken,
+			AllowHTTP: settings.s3AllowHTTP, CreateBucket: settings.s3CreateBucket,
+		})
+	} else {
+		objects, err = archive.NewFilesystem(filepath.Join(settings.dataDir, "content"))
+	}
 	if err != nil {
 		logger.Error("cannot open content archive", "error", err)
 		os.Exit(2)
 	}
-	events, err := audit.NewJSONLStore(filepath.Join(settings.dataDir, "audit.jsonl"))
-	if err != nil {
-		logger.Error("cannot open audit store", "error", err)
-		os.Exit(2)
+	var events audit.Store
+	var closeEvents func()
+	if settings.databaseURL != "" {
+		postgresEvents, openErr := postgresstore.New(context.Background(), settings.databaseURL)
+		if openErr != nil {
+			logger.Error("cannot open postgres audit store", "error", openErr)
+			os.Exit(2)
+		}
+		events = postgresEvents
+		closeEvents = postgresEvents.Close
+	} else {
+		fileEvents, openErr := audit.NewJSONLStore(filepath.Join(settings.dataDir, "audit.jsonl"))
+		if openErr != nil {
+			logger.Error("cannot open audit store", "error", openErr)
+			os.Exit(2)
+		}
+		events = fileEvents
+		closeEvents = func() {}
 	}
+	defer closeEvents()
 	identityKey, err := loadOrCreateKey(filepath.Join(settings.dataDir, "identity-hmac.key"))
 	if err != nil {
 		logger.Error("cannot load identity key", "error", err)
@@ -83,9 +144,56 @@ func main() {
 		logger.Error("cannot create policy engine", "error", err)
 		os.Exit(2)
 	}
-	controller := control.NewService(objects, events, resolver, policies, settings.maxRequestBytes)
+	controller := control.NewService(objects, events, resolver, policies, settings.maxRequestBytes, telemetryRecorder)
+	admin, err := dashboard.New(events, objects)
+	if err != nil {
+		logger.Error("cannot create dashboard", "error", err)
+		os.Exit(2)
+	}
+	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+	baseTransport.DisableCompression = true
+	baseTransport.DisableKeepAlives = true
+	var upstreamTransport http.RoundTripper = baseTransport
+	if settings.toolsEnabled {
+		httpTool := gatewaytool.NewHTTPTool(gatewaytool.HTTPConfig{
+			AllowedHosts: settings.toolHosts, PathPrefixes: settings.toolPaths, BearerToken: settings.toolBearerToken,
+			AllowPrivate: settings.toolAllowPrivate, Timeout: settings.toolTimeout, MaxResultBytes: settings.toolMaxBytes,
+		})
+		toolRegistry, registryErr := gatewaytool.NewRegistry(httpTool)
+		if registryErr != nil {
+			logger.Error("cannot register gateway tools", "error", registryErr)
+			os.Exit(2)
+		}
+		toolKey, keyErr := loadOrCreateKey(filepath.Join(settings.dataDir, "gateway-tool-hmac.key"))
+		if keyErr != nil {
+			logger.Error("cannot load gateway tool fingerprint key", "error", keyErr)
+			os.Exit(2)
+		}
+		toolFingerprinter, fingerprintErr := gatewaytool.NewFingerprinter(toolKey)
+		if fingerprintErr != nil {
+			logger.Error("cannot create gateway tool fingerprinter", "error", fingerprintErr)
+			os.Exit(2)
+		}
+		coordinator, coordinatorErr := gatewaytool.NewCoordinator(gatewaytool.CoordinatorConfig{
+			Next: upstreamTransport, Registry: toolRegistry, Fingerprinter: toolFingerprinter, MaxBody: settings.maxRequestBytes, Observer: controller,
+		})
+		if coordinatorErr != nil {
+			logger.Error("cannot create gateway tool coordinator", "error", coordinatorErr)
+			os.Exit(2)
+		}
+		upstreamTransport = coordinator
+	}
+	if settings.identityProbe {
+		probeTransport, probeErr := identity.NewProbeTransport(upstreamTransport, resolver, events, settings.maxRequestBytes)
+		if probeErr != nil {
+			logger.Error("cannot create identity probe", "error", probeErr)
+			os.Exit(2)
+		}
+		upstreamTransport = probeTransport
+	}
 	handler, err := proxy.NewHandler(proxy.Config{
 		Upstream:        settings.upstream,
+		Transport:       upstreamTransport,
 		Banner:          transformer,
 		MaxRequestBytes: settings.maxRequestBytes,
 		MaxSessionBytes: settings.maxSessionBytes,
@@ -107,7 +215,19 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
+	adminServer := &http.Server{
+		Handler:           admin.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       time.Minute,
+	}
+	adminListener, err := net.Listen("tcp", settings.adminAddr)
+	if err != nil {
+		_ = listener.Close()
+		logger.Error("cannot listen for dashboard", "error", err)
+		os.Exit(2)
+	}
 	logger.Info("gaitway ready", "address", listener.Addr().String(), "activation", settings.activation != "")
+	logger.Warn("dashboard has no application authentication", "address", adminListener.Addr().String())
 
 	stopping, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -116,6 +236,13 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = server.Shutdown(ctx)
+		_ = adminServer.Shutdown(ctx)
+	}()
+	go func() {
+		if err := adminServer.Serve(adminListener); err != nil && err != http.ErrServerClosed {
+			logger.Error("dashboard stopped unexpectedly", "error", err)
+			stop()
+		}
 	}()
 	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 		logger.Error("gateway stopped unexpectedly", "error", err)
@@ -135,6 +262,41 @@ func loadConfig() (config, error) {
 		secretAction:     plugin.Action(envOr("GAITWAY_SECRET_ACTION", "reject")),
 		approvedModels:   splitList(os.Getenv("GAITWAY_APPROVED_MODELS")),
 		budgetWindow:     time.Hour,
+		adminAddr:        envOr("GAITWAY_ADMIN_ADDR", "127.0.0.1:8081"),
+		databaseURL:      os.Getenv("DATABASE_URL"),
+		otelEndpoint:     os.Getenv("GAITWAY_OTEL_ENDPOINT"),
+		toolHosts:        splitList(os.Getenv("GAITWAY_HTTP_TOOL_HOSTS")),
+		toolPaths:        splitList(os.Getenv("GAITWAY_HTTP_TOOL_PATHS")),
+		toolBearerToken:  os.Getenv("GAITWAY_HTTP_TOOL_BEARER_TOKEN"),
+		toolTimeout:      10 * time.Second,
+		toolMaxBytes:     1 << 20,
+		archiveBackend:   envOr("GAITWAY_ARCHIVE_BACKEND", "filesystem"),
+		s3Endpoint:       os.Getenv("GAITWAY_S3_ENDPOINT"),
+		s3Region:         os.Getenv("GAITWAY_S3_REGION"),
+		s3Bucket:         os.Getenv("GAITWAY_S3_BUCKET"),
+		s3Prefix:         os.Getenv("GAITWAY_S3_PREFIX"),
+		s3AccessKey:      os.Getenv("GAITWAY_S3_ACCESS_KEY"),
+		s3SecretKey:      os.Getenv("GAITWAY_S3_SECRET_KEY"),
+		s3SessionToken:   os.Getenv("GAITWAY_S3_SESSION_TOKEN"),
+	}
+	var boolErr error
+	if result.toolsEnabled, boolErr = envBool("GAITWAY_TOOLS_ENABLED", false); boolErr != nil {
+		return config{}, boolErr
+	}
+	if result.toolAllowPrivate, boolErr = envBool("GAITWAY_HTTP_TOOL_ALLOW_PRIVATE", false); boolErr != nil {
+		return config{}, boolErr
+	}
+	if result.s3AllowHTTP, boolErr = envBool("GAITWAY_S3_ALLOW_HTTP", false); boolErr != nil {
+		return config{}, boolErr
+	}
+	if result.s3CreateBucket, boolErr = envBool("GAITWAY_S3_CREATE_BUCKET", false); boolErr != nil {
+		return config{}, boolErr
+	}
+	if result.identityProbe, boolErr = envBool("GAITWAY_IDENTITY_PROBE", true); boolErr != nil {
+		return config{}, boolErr
+	}
+	if result.archiveBackend != "filesystem" && result.archiveBackend != "s3" {
+		return config{}, fmt.Errorf("GAITWAY_ARCHIVE_BACKEND must be filesystem or s3")
 	}
 	if activation, exists := os.LookupEnv("GAITWAY_ACTIVATION_MESSAGE"); exists {
 		result.activation = activation
@@ -186,6 +348,14 @@ func loadConfig() (config, error) {
 	if result.budgetHard, err = nonNegativeInt64("GAITWAY_BUDGET_HARD_UNITS", 0); err != nil {
 		return config{}, err
 	}
+	if raw := os.Getenv("GAITWAY_HTTP_TOOL_TIMEOUT"); raw != "" {
+		if result.toolTimeout, err = time.ParseDuration(raw); err != nil || result.toolTimeout <= 0 {
+			return config{}, fmt.Errorf("GAITWAY_HTTP_TOOL_TIMEOUT must be a positive duration")
+		}
+	}
+	if result.toolMaxBytes, err = positiveInt64("GAITWAY_HTTP_TOOL_MAX_RESULT_BYTES", result.toolMaxBytes); err != nil {
+		return config{}, err
+	}
 	return result, nil
 }
 
@@ -233,6 +403,18 @@ func splitList(raw string) []string {
 		}
 	}
 	return result
+}
+
+func envBool(name string, fallback bool) (bool, error) {
+	raw, exists := os.LookupEnv(name)
+	if !exists {
+		return fallback, nil
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("%s must be true or false", name)
+	}
+	return value, nil
 }
 
 func loadOrCreateKey(path string) ([]byte, error) {
