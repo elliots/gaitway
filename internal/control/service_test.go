@@ -169,3 +169,17 @@ func TestAllowedRequestFailsClosedWhenAuditIsUnavailable(t *testing.T) {
 		t.Fatalf("request escaped failed audit store: status=%d", response.Code)
 	}
 }
+
+func TestActivationEligibilityExcludesClaudeSessionTitles(t *testing.T) {
+	title := []byte(`{"system":[{"type":"text","text":"You are Claude Code."},{"type":"text","text":"You are naming a coding session so the user can pick it out of a long list of sessions."}],"messages":[]}`)
+	if activationEligible(title) {
+		t.Fatal("session-title request could consume the visible activation marker")
+	}
+	main := []byte(`{"system":[{"type":"text","text":"You are Claude Code, an interactive coding agent."}],"messages":[]}`)
+	if !activationEligible(main) {
+		t.Fatal("user-facing request was excluded from activation")
+	}
+	if !activationEligible([]byte(`{"future":true}`)) {
+		t.Fatal("unknown future request shape was excluded from activation")
+	}
+}

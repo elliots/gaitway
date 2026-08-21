@@ -74,6 +74,59 @@ func TestStreamingMessagesPassesThroughAndActivatesOnce(t *testing.T) {
 	}
 }
 
+func TestHiddenMetadataRequestCannotConsumeActivation(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(writer, testSSE)
+	}))
+	defer upstream.Close()
+	parsed, _ := url.Parse(upstream.URL)
+	hooks := &visibilityHooks{}
+	handler, err := NewHandler(Config{
+		Upstream: parsed, Banner: banner.NewTransformer("active", banner.NewRegistry(10), 1<<20, 8<<20),
+		MaxRequestBytes: 1 << 20, MaxSessionBytes: 256,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Hooks: hooks,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := httptest.NewServer(handler)
+	defer gateway.Close()
+
+	for index, visible := range []bool{false, true, true} {
+		request, _ := http.NewRequest(http.MethodPost, gateway.URL+"/v1/messages", strings.NewReader(`{}`))
+		request.Header.Set("x-claude-code-session-id", "same-session")
+		if visible {
+			request.Header.Set("X-Test-User-Visible", "1")
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		count := strings.Count(string(body), `"text":"active\n\n"`)
+		want := 0
+		if index == 1 {
+			want = 1
+		}
+		if count != want {
+			t.Fatalf("request %d activation count=%d want=%d: %s", index, count, want, body)
+		}
+	}
+}
+
+type visibilityHooks struct{}
+
+func (*visibilityHooks) Prepare(_ http.ResponseWriter, request *http.Request) (*http.Request, bool) {
+	return request, true
+}
+func (*visibilityHooks) WrapResponse(*http.Request, *http.Response) {}
+func (*visibilityHooks) Fail(*http.Request, error)                  {}
+func (*visibilityHooks) ActivationEligible(request *http.Request) bool {
+	return request.Header.Get("X-Test-User-Visible") == "1"
+}
+
 func TestCountTokensIsAlwaysPassive(t *testing.T) {
 	original := `{"input_tokens":7,"future":true}`
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {

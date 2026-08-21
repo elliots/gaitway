@@ -30,6 +30,10 @@ type Hooks interface {
 	Fail(*http.Request, error)
 }
 
+type activationEligibility interface {
+	ActivationEligible(*http.Request) bool
+}
+
 type claimKey struct{}
 
 func NewHandler(config Config) (http.Handler, error) {
@@ -118,7 +122,11 @@ func NewHandler(config Config) (http.Handler, error) {
 			}
 		}
 		if request.URL.Path == "/v1/messages" && config.Banner != nil {
-			if session, ok := safeSession(request.Header.Values("x-claude-code-session-id"), config.MaxSessionBytes); ok && config.Banner.Claim(session) {
+			eligible := true
+			if classifier, ok := config.Hooks.(activationEligibility); ok {
+				eligible = classifier.ActivationEligible(request)
+			}
+			if session, ok := safeSession(request.Header.Values("x-claude-code-session-id"), config.MaxSessionBytes); eligible && ok && config.Banner.Claim(session) {
 				request = request.WithContext(context.WithValue(request.Context(), claimKey{}, session))
 			}
 		}

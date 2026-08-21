@@ -46,13 +46,14 @@ type Telemetry interface {
 type transactionKey struct{}
 
 type transaction struct {
-	once       sync.Once
-	id         string
-	identity   identity.Identity
-	route      string
-	model      string
-	started    time.Time
-	requestRef archive.Object
+	once               sync.Once
+	id                 string
+	identity           identity.Identity
+	route              string
+	model              string
+	started            time.Time
+	requestRef         archive.Object
+	activationEligible bool
 }
 
 func NewService(objects archive.Store, events audit.Store, resolver *identity.Resolver, policies *plugin.Engine, maxBody int64, telemetry ...Telemetry) *Service {
@@ -134,13 +135,51 @@ func (s *Service) Prepare(writer http.ResponseWriter, request *http.Request) (*h
 	if s.telemetry != nil {
 		requestContext = s.telemetry.Begin(requestContext, route)
 	}
-	tx := &transaction{id: id, identity: identityValue, route: route, model: model, started: time.Now().UTC(), requestRef: object}
+	tx := &transaction{
+		id: id, identity: identityValue, route: route, model: model,
+		started: time.Now().UTC(), requestRef: object,
+		activationEligible: activationEligible(body),
+	}
 	if s.audit.Append(request.Context(), audit.Event{ID: randomID(), RequestID: id, Type: "request", Time: tx.started, Principal: identityValue.Principal, Session: identityValue.Session, Agent: identityValue.Agent, ParentAgent: identityValue.ParentAgent, Username: identityValue.Username, Hostname: identityValue.Hostname, Assurance: identityValue.Assurance, Route: route, Model: model, Outcome: string(decision.Action), ContentRef: object.Ref, ContentSHA: object.SHA256, ContentSize: object.Size, Policy: decision.Code}) != nil {
 		s.policies.Reconcile(identityValue.Principal, id, 0, false, time.Now().UTC())
 		writeError(writer, http.StatusServiceUnavailable, "audit_unavailable", "request audit could not be recorded")
 		return request, false
 	}
 	return request.WithContext(context.WithValue(requestContext, transactionKey{}, tx)), true
+}
+
+// ActivationEligible distinguishes user-facing Claude work from invisible
+// metadata calls that share the same Claude session header.
+func (s *Service) ActivationEligible(request *http.Request) bool {
+	tx, _ := request.Context().Value(transactionKey{}).(*transaction)
+	return tx == nil || tx.activationEligible
+}
+
+func activationEligible(body []byte) bool {
+	const titleInstruction = "You are naming a coding session"
+	var payload struct {
+		System json.RawMessage `json:"system"`
+	}
+	if json.Unmarshal(body, &payload) != nil {
+		return true
+	}
+	var plain string
+	if json.Unmarshal(payload.System, &plain) == nil {
+		return !strings.Contains(plain, titleInstruction)
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(payload.System, &blocks) != nil {
+		return true
+	}
+	for _, block := range blocks {
+		if block.Type == "text" && strings.Contains(block.Text, titleInstruction) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Service) consumeAcknowledgement(body []byte, principal, session string) ([]byte, bool, bool) {
