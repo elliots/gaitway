@@ -94,6 +94,18 @@ func TestServiceArchivesAndAuditsWithoutCredential(t *testing.T) {
 	}
 }
 
+func TestResponseUsageReadsStreamingStartAndEnd(t *testing.T) {
+	body := []byte("event: message_start\n" +
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":7,"cache_read_input_tokens":11,"cache_creation_input_tokens":13}}}` + "\n\n" +
+		"event: message_delta\n" +
+		`data: {"type":"message_delta","usage":{"output_tokens":17}}` + "\n\n")
+	got := responseUsage(body)
+	want := usage{Input: 7, Output: 17, CacheRead: 11, CacheWrite: 13}
+	if got != want {
+		t.Fatalf("usage = %+v, want %+v", got, want)
+	}
+}
+
 func TestServiceRejectsSecretWithoutArchivingBody(t *testing.T) {
 	root := t.TempDir()
 	objects, _ := archive.NewFilesystem(filepath.Join(root, "content"))

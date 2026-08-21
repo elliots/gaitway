@@ -47,8 +47,8 @@ func (b *BudgetPolicy) Evaluate(_ context.Context, request Request) Decision {
 	if entry.started.IsZero() || request.Now.Sub(entry.started) >= b.window {
 		entry = budgetWindow{started: request.Now, reservations: make(map[string]int64)}
 	}
-	if entry.used+entry.reserved+units > b.hard {
-		return Decision{Action: Reject, Status: 429, Code: "usage_limit", Message: "usage hard limit reached", Findings: []Finding{{Plugin: b.Name(), Rule: "hard-cap", Message: "request reservation rejected"}}}
+	if entry.used >= b.hard {
+		return Decision{Action: Reject, Status: 429, Code: "usage_limit", Message: "usage hard limit reached", Findings: []Finding{{Plugin: b.Name(), Rule: "hard-cap", Message: "usage limit reached before request"}}}
 	}
 	entry.reserved += units
 	if request.Acknowledged {

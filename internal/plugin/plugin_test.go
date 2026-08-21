@@ -27,7 +27,7 @@ func TestSecretScannerRejectsAndMasks(t *testing.T) {
 }
 
 func TestModelPolicy(t *testing.T) {
-	policy := NewModelPolicy([]string{"claude-approved"})
+	policy := NewModelPolicy([]string{"claude-approved"}, nil)
 	if got := policy.Evaluate(context.Background(), Request{Route: "messages", Model: "claude-other"}); got.Action != Reject {
 		t.Fatalf("disallowed model accepted: %+v", got)
 	}
@@ -36,7 +36,17 @@ func TestModelPolicy(t *testing.T) {
 	}
 }
 
-func TestBudgetReservationsAreAtomic(t *testing.T) {
+func TestModelPolicyBlocksFamily(t *testing.T) {
+	policy := NewModelPolicy(nil, []string{"haiku"})
+	if got := policy.Evaluate(context.Background(), Request{Route: "messages", Model: "claude-HAIKU-4-5"}); got.Action != Reject || got.Findings[0].Rule != "blocked-family" {
+		t.Fatalf("blocked family accepted: %+v", got)
+	}
+	if got := policy.Evaluate(context.Background(), Request{Route: "messages", Model: "claude-sonnet-5"}); got.Action != Allow {
+		t.Fatalf("unblocked family rejected: %+v", got)
+	}
+}
+
+func TestBudgetAllowsConcurrentRequestsBeforeRecordedLimit(t *testing.T) {
 	policy := NewBudgetPolicy(time.Hour, 0, 100)
 	now := time.Now()
 	var allowed atomic.Int32
@@ -51,8 +61,22 @@ func TestBudgetReservationsAreAtomic(t *testing.T) {
 		}()
 	}
 	group.Wait()
-	if allowed.Load() != 10 {
-		t.Fatalf("allowed %d reservations, want 10", allowed.Load())
+	if allowed.Load() != 20 {
+		t.Fatalf("allowed %d reservations, want 20", allowed.Load())
+	}
+}
+
+func TestBudgetRejectsRequestAfterRecordedLimit(t *testing.T) {
+	policy := NewBudgetPolicy(time.Hour, 0, 100)
+	now := time.Now()
+	request := Request{ID: "one", Principal: "p", Route: "messages", Body: []byte("x"), Now: now}
+	if got := policy.Evaluate(context.Background(), request); got.Action != Allow {
+		t.Fatalf("request before limit rejected: %+v", got)
+	}
+	policy.Reconcile("p", "one", 101, true, now)
+	request.ID = "two"
+	if got := policy.Evaluate(context.Background(), request); got.Action != Reject || got.Code != "usage_limit" {
+		t.Fatalf("request after limit accepted: %+v", got)
 	}
 }
 

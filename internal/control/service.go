@@ -447,18 +447,24 @@ func (b *captureBody) done(err error) {
 
 type usage struct{ Input, Output, CacheRead, CacheWrite int64 }
 
+type usagePayload struct {
+	Input      int64 `json:"input_tokens"`
+	Output     int64 `json:"output_tokens"`
+	CacheRead  int64 `json:"cache_read_input_tokens"`
+	CacheWrite int64 `json:"cache_creation_input_tokens"`
+}
+
 func responseUsage(body []byte) usage {
 	var result usage
 	var payload struct {
-		Usage struct {
-			Input      int64 `json:"input_tokens"`
-			Output     int64 `json:"output_tokens"`
-			CacheRead  int64 `json:"cache_read_input_tokens"`
-			CacheWrite int64 `json:"cache_creation_input_tokens"`
-		} `json:"usage"`
+		Usage   usagePayload `json:"usage"`
+		Message struct {
+			Usage usagePayload `json:"usage"`
+		} `json:"message"`
 	}
 	if json.Unmarshal(body, &payload) == nil {
-		result = usage{payload.Usage.Input, payload.Usage.Output, payload.Usage.CacheRead, payload.Usage.CacheWrite}
+		mergeUsage(&result, payload.Message.Usage)
+		mergeUsage(&result, payload.Usage)
 		return result
 	}
 	for _, line := range bytes.Split(body, []byte("\n")) {
@@ -467,17 +473,26 @@ func responseUsage(body []byte) usage {
 		}
 		data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
 		if json.Unmarshal(data, &payload) == nil {
-			if payload.Usage.Input != 0 {
-				result.Input = payload.Usage.Input
-			}
-			if payload.Usage.Output != 0 {
-				result.Output = payload.Usage.Output
-			}
-			result.CacheRead = payload.Usage.CacheRead
-			result.CacheWrite = payload.Usage.CacheWrite
+			mergeUsage(&result, payload.Message.Usage)
+			mergeUsage(&result, payload.Usage)
 		}
 	}
 	return result
+}
+
+func mergeUsage(result *usage, current usagePayload) {
+	if current.Input != 0 {
+		result.Input = current.Input
+	}
+	if current.Output != 0 {
+		result.Output = current.Output
+	}
+	if current.CacheRead != 0 {
+		result.CacheRead = current.CacheRead
+	}
+	if current.CacheWrite != 0 {
+		result.CacheWrite = current.CacheWrite
+	}
 }
 
 func requestModel(body []byte) string {

@@ -43,6 +43,7 @@ type config struct {
 	dataDir          string
 	secretAction     plugin.Action
 	approvedModels   []string
+	blockedModels    []string
 	budgetWindow     time.Duration
 	budgetWarning    int64
 	budgetHard       int64
@@ -137,7 +138,7 @@ func main() {
 	}
 	policies, err := plugin.NewEngine(100*time.Millisecond,
 		plugin.NewSecretScanner(settings.secretAction),
-		plugin.NewModelPolicy(settings.approvedModels),
+		plugin.NewModelPolicy(settings.approvedModels, settings.blockedModels),
 		plugin.NewBudgetPolicy(settings.budgetWindow, settings.budgetWarning, settings.budgetHard),
 	)
 	if err != nil {
@@ -261,6 +262,7 @@ func loadConfig() (config, error) {
 		dataDir:          envOr("GAITWAY_DATA_DIR", "./data"),
 		secretAction:     plugin.Action(envOr("GAITWAY_SECRET_ACTION", "reject")),
 		approvedModels:   splitList(os.Getenv("GAITWAY_APPROVED_MODELS")),
+		blockedModels:    splitList(envOr("GAITWAY_BLOCKED_MODEL_FAMILIES", "haiku")),
 		budgetWindow:     time.Hour,
 		adminAddr:        envOr("GAITWAY_ADMIN_ADDR", "127.0.0.1:8081"),
 		databaseURL:      os.Getenv("DATABASE_URL"),
@@ -345,7 +347,7 @@ func loadConfig() (config, error) {
 	if result.budgetWarning, err = nonNegativeInt64("GAITWAY_BUDGET_WARNING_UNITS", 0); err != nil {
 		return config{}, err
 	}
-	if result.budgetHard, err = nonNegativeInt64("GAITWAY_BUDGET_HARD_UNITS", 0); err != nil {
+	if result.budgetHard, err = nonNegativeInt64("GAITWAY_BUDGET_HARD_UNITS", 5_000); err != nil {
 		return config{}, err
 	}
 	if raw := os.Getenv("GAITWAY_HTTP_TOOL_TIMEOUT"); raw != "" {

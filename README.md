@@ -63,9 +63,10 @@ never persisted; only a keyed HMAC fingerprint is retained.
 | `GAITWAY_S3_CREATE_BUCKET` | `false` | Create a missing bucket at startup |
 | `GAITWAY_SECRET_ACTION` | `reject` | `reject` or `allow` detected secret patterns |
 | `GAITWAY_APPROVED_MODELS` | empty | Comma-separated exact Claude model allowlist |
+| `GAITWAY_BLOCKED_MODEL_FAMILIES` | `haiku` | Case-insensitive model-name fragments to reject |
 | `GAITWAY_BUDGET_WINDOW` | `1h` | Per-principal usage window |
 | `GAITWAY_BUDGET_WARNING_UNITS` | `0` | Visible acknowledgement threshold; `0` disables |
-| `GAITWAY_BUDGET_HARD_UNITS` | `0` | Atomic hard cap; `0` disables |
+| `GAITWAY_BUDGET_HARD_UNITS` | `5000` | Reject the request after recorded usage reaches this token cap; `0` disables |
 | `GAITWAY_OTEL_ENDPOINT` | empty | OTLP/HTTP base URL; empty disables export |
 | `GAITWAY_TOOLS_ENABLED` | `false` | Enable central tool injection and coordination |
 | `GAITWAY_HTTP_TOOL_HOSTS` | empty | Exact comma-separated HTTPS host allowlist |
@@ -81,6 +82,12 @@ private/link-local destinations by default, does not follow an unapproved
 redirect, bounds results, coalesces duplicate executions, and keeps the brief
 mixed local/gateway-tool handoff in bounded process memory. Internal tool state
 is never printed into Claude's transcript.
+
+The default 5,000-token budget is a deliberately simple five-cent equivalent
+at Claude Sonnet 5's current $10-per-million output-token price. Input, output,
+cache-read, and cache-write tokens all count equally, so it is a conservative
+test control rather than invoice accounting. The request that crosses the cap
+finishes; the following request is rejected.
 
 ## Docker Compose
 
