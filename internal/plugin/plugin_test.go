@@ -47,7 +47,7 @@ func TestModelPolicyBlocksFamily(t *testing.T) {
 }
 
 func TestBudgetAllowsConcurrentRequestsBeforeRecordedLimit(t *testing.T) {
-	policy := NewBudgetPolicy(time.Hour, 0, 100)
+	policy := NewBudgetPolicy(time.Hour, 0, 100, "")
 	now := time.Now()
 	var allowed atomic.Int32
 	var group sync.WaitGroup
@@ -67,21 +67,24 @@ func TestBudgetAllowsConcurrentRequestsBeforeRecordedLimit(t *testing.T) {
 }
 
 func TestBudgetRejectsRequestAfterRecordedLimit(t *testing.T) {
-	policy := NewBudgetPolicy(time.Hour, 0, 100)
+	policy := NewBudgetPolicy(4*time.Hour, 0, 100, "Company Claude allowance exhausted")
 	now := time.Now()
 	request := Request{ID: "one", Principal: "p", Route: "messages", Body: []byte("x"), Now: now}
 	if got := policy.Evaluate(context.Background(), request); got.Action != Allow {
 		t.Fatalf("request before limit rejected: %+v", got)
 	}
-	policy.Reconcile("p", "one", 101, true, now)
+	policy.Reconcile("p", "one", 101, true, now.Add(2*time.Hour))
 	request.ID = "two"
+	request.Now = now.Add(2 * time.Hour)
 	if got := policy.Evaluate(context.Background(), request); got.Action != Reject || got.Code != "usage_limit" {
 		t.Fatalf("request after limit accepted: %+v", got)
+	} else if !strings.Contains(got.Message, "Company Claude allowance exhausted: 101/100 tokens used in the 4-hour window; resets in 2 hours") {
+		t.Fatalf("limit message is not useful: %q", got.Message)
 	}
 }
 
 func TestBudgetReconcilesEstimateToProviderUsage(t *testing.T) {
-	policy := NewBudgetPolicy(time.Hour, 0, 20)
+	policy := NewBudgetPolicy(time.Hour, 0, 20, "")
 	now := time.Now()
 	request := Request{ID: "one", Principal: "p", Route: "messages", Body: []byte(strings.Repeat("x", 36)), Now: now}
 	if decision := policy.Evaluate(context.Background(), request); decision.Action != Allow {
@@ -108,7 +111,7 @@ func TestPluginPanicFailsClosed(t *testing.T) {
 }
 
 func TestBudgetAcknowledgementLastsForWindow(t *testing.T) {
-	policy := NewBudgetPolicy(time.Hour, 1, 1000)
+	policy := NewBudgetPolicy(time.Hour, 1, 1000, "")
 	now := time.Now()
 	first := Request{ID: "one", Principal: "p", Route: "messages", Body: []byte("x"), Now: now}
 	if decision := policy.Evaluate(context.Background(), first); decision.Action != Warn {

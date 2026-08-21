@@ -47,6 +47,7 @@ type config struct {
 	budgetWindow     time.Duration
 	budgetWarning    int64
 	budgetHard       int64
+	budgetMessage    string
 	adminAddr        string
 	databaseURL      string
 	otelEndpoint     string
@@ -139,7 +140,7 @@ func main() {
 	policies, err := plugin.NewEngine(100*time.Millisecond,
 		plugin.NewSecretScanner(settings.secretAction),
 		plugin.NewModelPolicy(settings.approvedModels, settings.blockedModels),
-		plugin.NewBudgetPolicy(settings.budgetWindow, settings.budgetWarning, settings.budgetHard),
+		plugin.NewBudgetPolicy(settings.budgetWindow, settings.budgetWarning, settings.budgetHard, settings.budgetMessage),
 	)
 	if err != nil {
 		logger.Error("cannot create policy engine", "error", err)
@@ -263,7 +264,8 @@ func loadConfig() (config, error) {
 		secretAction:     plugin.Action(envOr("GAITWAY_SECRET_ACTION", "reject")),
 		approvedModels:   splitList(os.Getenv("GAITWAY_APPROVED_MODELS")),
 		blockedModels:    splitList(envOr("GAITWAY_BLOCKED_MODEL_FAMILIES", "haiku")),
-		budgetWindow:     time.Hour,
+		budgetWindow:     4 * time.Hour,
+		budgetMessage:    envOr("GAITWAY_BUDGET_LIMIT_MESSAGE", "Gaitway usage limit reached"),
 		adminAddr:        envOr("GAITWAY_ADMIN_ADDR", "127.0.0.1:8081"),
 		databaseURL:      os.Getenv("DATABASE_URL"),
 		otelEndpoint:     os.Getenv("GAITWAY_OTEL_ENDPOINT"),

@@ -130,7 +130,7 @@ func TestUsageWarningRequiresVisibleAcknowledgement(t *testing.T) {
 	objects, _ := archive.NewFilesystem(filepath.Join(root, "content"))
 	events, _ := audit.NewJSONLStore(filepath.Join(root, "audit.jsonl"))
 	resolver, _ := identity.NewResolver([]byte(strings.Repeat("k", 32)))
-	policies, _ := plugin.NewEngine(time.Second, plugin.NewBudgetPolicy(time.Hour, 1, 10_000))
+	policies, _ := plugin.NewEngine(time.Second, plugin.NewBudgetPolicy(time.Hour, 1, 10_000, ""))
 	service := NewService(objects, events, resolver, policies, 1<<20)
 	body := `{"model":"claude-test","stream":false,"messages":[{"role":"user","content":"hello"}]}`
 	request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))

@@ -8,11 +8,12 @@ import (
 )
 
 type BudgetPolicy struct {
-	mu      sync.Mutex
-	window  time.Duration
-	warning int64
-	hard    int64
-	usage   map[string]budgetWindow
+	mu           sync.Mutex
+	window       time.Duration
+	warning      int64
+	hard         int64
+	limitMessage string
+	usage        map[string]budgetWindow
 }
 
 type budgetWindow struct {
@@ -23,8 +24,11 @@ type budgetWindow struct {
 	acknowledged bool
 }
 
-func NewBudgetPolicy(window time.Duration, warning, hard int64) *BudgetPolicy {
-	return &BudgetPolicy{window: window, warning: warning, hard: hard, usage: make(map[string]budgetWindow)}
+func NewBudgetPolicy(window time.Duration, warning, hard int64, limitMessage string) *BudgetPolicy {
+	if limitMessage == "" {
+		limitMessage = "Gaitway usage limit reached"
+	}
+	return &BudgetPolicy{window: window, warning: warning, hard: hard, limitMessage: limitMessage, usage: make(map[string]budgetWindow)}
 }
 
 func (*BudgetPolicy) Name() string { return "usage-budget" }
@@ -48,7 +52,8 @@ func (b *BudgetPolicy) Evaluate(_ context.Context, request Request) Decision {
 		entry = budgetWindow{started: request.Now, reservations: make(map[string]int64)}
 	}
 	if entry.used >= b.hard {
-		return Decision{Action: Reject, Status: 429, Code: "usage_limit", Message: "usage hard limit reached", Findings: []Finding{{Plugin: b.Name(), Rule: "hard-cap", Message: "usage limit reached before request"}}}
+		message := fmt.Sprintf("%s: %d/%d tokens used in the %s window; resets in %s", b.limitMessage, entry.used, b.hard, windowLabel(b.window), remainingTime(entry.started.Add(b.window).Sub(request.Now)))
+		return Decision{Action: Reject, Status: 429, Code: "usage_limit", Message: message, Findings: []Finding{{Plugin: b.Name(), Rule: "hard-cap", Message: message}}}
 	}
 	entry.reserved += units
 	if request.Acknowledged {
@@ -62,6 +67,39 @@ func (b *BudgetPolicy) Evaluate(_ context.Context, request Request) Decision {
 		return Decision{Action: Warn, Code: "usage_warning", Message: "usage warning threshold reached", Findings: []Finding{{Plugin: b.Name(), Rule: "warning", Message: "usage warning threshold reached"}}}
 	}
 	return Decision{Action: Allow}
+}
+
+func windowLabel(window time.Duration) string {
+	if window%time.Hour == 0 {
+		return fmt.Sprintf("%d-hour", window/time.Hour)
+	}
+	if window%time.Minute == 0 {
+		return fmt.Sprintf("%d-minute", window/time.Minute)
+	}
+	return window.String()
+}
+
+func remainingTime(remaining time.Duration) string {
+	if remaining <= 0 {
+		return "less than a minute"
+	}
+	minutes := int64((remaining + time.Minute - 1) / time.Minute)
+	hours := minutes / 60
+	minutes %= 60
+	if hours == 0 {
+		return plural(minutes, "minute")
+	}
+	if minutes == 0 {
+		return plural(hours, "hour")
+	}
+	return plural(hours, "hour") + " " + plural(minutes, "minute")
+}
+
+func plural(value int64, unit string) string {
+	if value == 1 {
+		return fmt.Sprintf("%d %s", value, unit)
+	}
+	return fmt.Sprintf("%d %ss", value, unit)
 }
 
 func (b *BudgetPolicy) Reconcile(principal, requestID string, actual int64, completed bool, now time.Time) {

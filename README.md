@@ -64,9 +64,10 @@ never persisted; only a keyed HMAC fingerprint is retained.
 | `GAITWAY_SECRET_ACTION` | `reject` | `reject` or `allow` detected secret patterns |
 | `GAITWAY_APPROVED_MODELS` | empty | Comma-separated exact Claude model allowlist |
 | `GAITWAY_BLOCKED_MODEL_FAMILIES` | `haiku` | Case-insensitive model-name fragments to reject |
-| `GAITWAY_BUDGET_WINDOW` | `1h` | Per-principal usage window |
+| `GAITWAY_BUDGET_WINDOW` | `4h` | Per-principal usage window |
 | `GAITWAY_BUDGET_WARNING_UNITS` | `0` | Visible acknowledgement threshold; `0` disables |
 | `GAITWAY_BUDGET_HARD_UNITS` | `5000` | Reject the request after recorded usage reaches this token cap; `0` disables |
+| `GAITWAY_BUDGET_LIMIT_MESSAGE` | `Gaitway usage limit reached` | Prefix for the limit error; usage, window, and reset time are appended |
 | `GAITWAY_OTEL_ENDPOINT` | empty | OTLP/HTTP base URL; empty disables export |
 | `GAITWAY_TOOLS_ENABLED` | `false` | Enable central tool injection and coordination |
 | `GAITWAY_HTTP_TOOL_HOSTS` | empty | Exact comma-separated HTTPS host allowlist |
