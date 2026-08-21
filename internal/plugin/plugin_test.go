@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -76,7 +77,7 @@ func TestBudgetRejectsRequestAfterRecordedLimit(t *testing.T) {
 	policy.Reconcile("p", "one", 101, true, now.Add(2*time.Hour))
 	request.ID = "two"
 	request.Now = now.Add(2 * time.Hour)
-	if got := policy.Evaluate(context.Background(), request); got.Action != Reject || got.Code != "usage_limit" {
+	if got := policy.Evaluate(context.Background(), request); got.Action != Reject || got.Code != "usage_limit" || got.Status != http.StatusPaymentRequired {
 		t.Fatalf("request after limit accepted: %+v", got)
 	} else if !strings.Contains(got.Message, "Company Claude allowance exhausted: 101/100 tokens used in the 4-hour window; resets in 2 hours") {
 		t.Fatalf("limit message is not useful: %q", got.Message)

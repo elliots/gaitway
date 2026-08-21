@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -53,7 +54,7 @@ func (b *BudgetPolicy) Evaluate(_ context.Context, request Request) Decision {
 	}
 	if entry.used >= b.hard {
 		message := fmt.Sprintf("%s: %d/%d tokens used in the %s window; resets in %s", b.limitMessage, entry.used, b.hard, windowLabel(b.window), remainingTime(entry.started.Add(b.window).Sub(request.Now)))
-		return Decision{Action: Reject, Status: 429, Code: "usage_limit", Message: message, Findings: []Finding{{Plugin: b.Name(), Rule: "hard-cap", Message: message}}}
+		return Decision{Action: Reject, Status: http.StatusPaymentRequired, Code: "usage_limit", Message: message, Findings: []Finding{{Plugin: b.Name(), Rule: "hard-cap", Message: message}}}
 	}
 	entry.reserved += units
 	if request.Acknowledged {
