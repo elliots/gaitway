@@ -68,7 +68,7 @@ type config struct {
 	s3SessionToken   string
 	s3AllowHTTP      bool
 	s3CreateBucket   bool
-	identityProbe    bool
+	oauthProfile     bool
 }
 
 func main() {
@@ -137,6 +137,13 @@ func main() {
 		logger.Error("cannot create identity resolver", "error", err)
 		os.Exit(2)
 	}
+	if err := restoreProfiles(context.Background(), events, resolver); err != nil {
+		logger.Error("cannot restore Anthropic identity mappings", "error", err)
+		os.Exit(2)
+	}
+	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+	baseTransport.DisableCompression = true
+	baseTransport.DisableKeepAlives = true
 	policies, err := plugin.NewEngine(100*time.Millisecond,
 		plugin.NewSecretScanner(settings.secretAction),
 		plugin.NewModelPolicy(settings.approvedModels, settings.blockedModels),
@@ -147,14 +154,19 @@ func main() {
 		os.Exit(2)
 	}
 	controller := control.NewService(objects, events, resolver, policies, settings.maxRequestBytes, telemetryRecorder)
+	if settings.oauthProfile {
+		profiles, profileErr := identity.NewProfileLookup(settings.upstream, baseTransport, resolver, events)
+		if profileErr != nil {
+			logger.Error("cannot create Anthropic identity lookup", "error", profileErr)
+			os.Exit(2)
+		}
+		controller.SetProfileLookup(profiles)
+	}
 	admin, err := dashboard.New(events, objects)
 	if err != nil {
 		logger.Error("cannot create dashboard", "error", err)
 		os.Exit(2)
 	}
-	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
-	baseTransport.DisableCompression = true
-	baseTransport.DisableKeepAlives = true
 	var upstreamTransport http.RoundTripper = baseTransport
 	if settings.toolsEnabled {
 		httpTool := gatewaytool.NewHTTPTool(gatewaytool.HTTPConfig{
@@ -184,14 +196,6 @@ func main() {
 			os.Exit(2)
 		}
 		upstreamTransport = coordinator
-	}
-	if settings.identityProbe {
-		probeTransport, probeErr := identity.NewProbeTransport(upstreamTransport, resolver, events, settings.maxRequestBytes)
-		if probeErr != nil {
-			logger.Error("cannot create identity probe", "error", probeErr)
-			os.Exit(2)
-		}
-		upstreamTransport = probeTransport
 	}
 	handler, err := proxy.NewHandler(proxy.Config{
 		Upstream:        settings.upstream,
@@ -282,6 +286,7 @@ func loadConfig() (config, error) {
 		s3AccessKey:      os.Getenv("GAITWAY_S3_ACCESS_KEY"),
 		s3SecretKey:      os.Getenv("GAITWAY_S3_SECRET_KEY"),
 		s3SessionToken:   os.Getenv("GAITWAY_S3_SESSION_TOKEN"),
+		oauthProfile:     true,
 	}
 	var boolErr error
 	if result.toolsEnabled, boolErr = envBool("GAITWAY_TOOLS_ENABLED", false); boolErr != nil {
@@ -296,7 +301,7 @@ func loadConfig() (config, error) {
 	if result.s3CreateBucket, boolErr = envBool("GAITWAY_S3_CREATE_BUCKET", false); boolErr != nil {
 		return config{}, boolErr
 	}
-	if result.identityProbe, boolErr = envBool("GAITWAY_IDENTITY_PROBE", true); boolErr != nil {
+	if result.oauthProfile, boolErr = envBool("GAITWAY_OAUTH_PROFILE", true); boolErr != nil {
 		return config{}, boolErr
 	}
 	if result.archiveBackend != "filesystem" && result.archiveBackend != "s3" {
@@ -349,7 +354,7 @@ func loadConfig() (config, error) {
 	if result.budgetWarning, err = nonNegativeInt64("GAITWAY_BUDGET_WARNING_UNITS", 0); err != nil {
 		return config{}, err
 	}
-	if result.budgetHard, err = nonNegativeInt64("GAITWAY_BUDGET_HARD_UNITS", 5_000); err != nil {
+	if result.budgetHard, err = nonNegativeInt64("GAITWAY_BUDGET_HARD_UNITS", 0); err != nil {
 		return config{}, err
 	}
 	if raw := os.Getenv("GAITWAY_HTTP_TOOL_TIMEOUT"); raw != "" {
@@ -407,6 +412,22 @@ func splitList(raw string) []string {
 		}
 	}
 	return result
+}
+
+func restoreProfiles(ctx context.Context, events audit.Store, resolver *identity.Resolver) error {
+	recent, err := events.List(ctx, 1000)
+	if err != nil {
+		return err
+	}
+	for _, event := range recent {
+		if event.AccountID != "" && event.OrganizationID != "" && !resolver.HasProfile(event.Principal) {
+			resolver.RecordProfile(event.Principal, identity.Profile{
+				AccountID: event.AccountID, OrganizationID: event.OrganizationID, Email: event.Email,
+				DisplayName: event.DisplayName, FullName: event.FullName,
+			})
+		}
+	}
+	return nil
 }
 
 func envBool(name string, fallback bool) (bool, error) {

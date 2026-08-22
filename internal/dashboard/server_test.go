@@ -15,12 +15,12 @@ import (
 
 func TestDashboardEscapesDataAndWarnsAboutAuth(t *testing.T) {
 	server, events, _ := testServer(t)
-	_ = events.Append(context.Background(), audit.Event{ID: "1", Type: "request", Time: time.Now(), Model: `<script>alert(1)</script>`, Outcome: "allow"})
+	_ = events.Append(context.Background(), audit.Event{ID: "1", Type: "request", Time: time.Now(), Email: "person@example.com", FullName: "Person Example", Model: `<script>alert(1)</script>`, Outcome: "allow"})
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
 	body := response.Body.String()
-	if strings.Contains(body, `<script>alert(1)</script>`) || !strings.Contains(body, "No application authentication") {
+	if strings.Contains(body, `<script>alert(1)</script>`) || !strings.Contains(body, "No application authentication") || !strings.Contains(body, "person@example.com") || !strings.Contains(body, "Person Example") {
 		t.Fatalf("unsafe or missing warning: %s", body)
 	}
 	if response.Header().Get("Content-Security-Policy") == "" || response.Header().Get("X-Content-Type-Options") != "nosniff" {

@@ -51,11 +51,11 @@ func (s *Store) Append(ctx context.Context, event audit.Event) error {
 	}
 	_, err = s.pool.Exec(ctx, `
         INSERT INTO gaitway_audit_events
-			(id, request_id, event_type, occurred_at, principal, session_id, route, model, outcome, content_ref, username, hostname, identity_assurance, data)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+			(id, request_id, event_type, occurred_at, principal, session_id, route, model, outcome, content_ref, identity_assurance, data)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
         ON CONFLICT (id) DO NOTHING`,
 		event.ID, event.RequestID, event.Type, event.Time, event.Principal, event.Session,
-		event.Route, event.Model, event.Outcome, event.ContentRef, event.Username, event.Hostname, event.Assurance, data)
+		event.Route, event.Model, event.Outcome, event.ContentRef, event.Assurance, data)
 	return err
 }
 

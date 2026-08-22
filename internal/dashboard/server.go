@@ -103,7 +103,7 @@ func (s *Server) filteredEvents(request *http.Request) ([]audit.Event, error) {
 		if typeFilter != "" && event.Type != typeFilter {
 			continue
 		}
-		if query != "" && !strings.Contains(strings.ToLower(event.Principal+" "+event.Session+" "+event.Username+" "+event.Hostname+" "+event.Route+" "+event.Model+" "+event.Outcome+" "+event.Policy+" "+event.Rule+" "+event.ToolName+" "+event.Classification), query) {
+		if query != "" && !strings.Contains(strings.ToLower(event.Principal+" "+event.AccountID+" "+event.OrganizationID+" "+event.Email+" "+event.DisplayName+" "+event.FullName+" "+event.Session+" "+event.Route+" "+event.Model+" "+event.Outcome+" "+event.Policy+" "+event.Rule+" "+event.ToolName+" "+event.Classification), query) {
 			continue
 		}
 		filtered = append(filtered, event)
@@ -177,11 +177,11 @@ const pageTemplate = `<!doctype html>
 <main>
   <p class="warning"><strong>No application authentication.</strong> Bind this console only to a trusted private interface.</p>
 	<div class="stats"><div class="stat"><strong>{{.Principals}}</strong>principals</div><div class="stat"><strong>{{.Sessions}}</strong>sessions</div><div class="stat"><strong>{{.InputTokens}}</strong>input tokens</div><div class="stat"><strong>{{.OutputTokens}}</strong>output tokens</div></div>
-  <form method="get"><input name="q" value="{{.Query}}" placeholder="filter principal, session, route, model, outcome"><button>Filter</button></form>
+  <form method="get"><input name="q" value="{{.Query}}" placeholder="filter person, email, account, session, route, model, outcome"><button>Filter</button></form>
   <table><thead><tr><th>Time</th><th>Type</th><th>Principal / Session</th><th>Route / Model</th><th>Outcome</th><th>Tokens</th><th>Evidence</th></tr></thead>
   <tbody>{{range .Events}}<tr>
     <td>{{.Time.Format "2006-01-02 15:04:05Z07:00"}}</td><td><span class="pill">{{.Type}}</span></td>
-    <td>{{if .Username}}{{.Username}} @ {{.Hostname}}<br>{{end}}{{short .Principal}}<br>{{short .Session}}</td><td>{{.Route}}<br>{{.Model}}{{if .ToolName}}<br>{{.ToolName}}{{end}}</td>
+    <td>{{if .FullName}}{{.FullName}}<br>{{else if .DisplayName}}{{.DisplayName}}<br>{{end}}{{if .Email}}{{.Email}}<br>{{end}}{{if .AccountID}}account {{short .AccountID}}<br>org {{short .OrganizationID}}<br>{{end}}{{short .Principal}}<br>{{short .Session}}</td><td>{{.Route}}<br>{{.Model}}{{if .ToolName}}<br>{{.ToolName}}{{end}}</td>
 	<td>{{.Outcome}}{{if .Policy}}<br>{{.Policy}}/{{.Rule}}{{end}}{{if .Classification}}<br>{{.Classification}}{{end}}</td><td>{{.InputTokens}} in<br>{{.OutputTokens}} out</td>
     <td>{{if .ContentRef}}<a href="/api/content/{{.ContentRef}}">open raw</a><br>{{.ContentSize}} bytes{{end}}</td>
   </tr>{{else}}<tr><td colspan="7">No events yet.</td></tr>{{end}}</tbody></table>

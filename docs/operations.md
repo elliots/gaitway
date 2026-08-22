@@ -76,5 +76,5 @@ version, run deterministic tests and `scripts/live-test.sh`, then manually
 exercise an interactive session, resume, fork/rewind, compaction, a subagent,
 parallel sessions, a usage acknowledgement, gateway-only HTTP, and a mixed
 Bash/HTTP turn. A missing activation marker, malformed stream, repeated tool
-effect, failed identity probe, credential canary, or missing archive object is
-a release blocker.
+effect, failed OAuth profile lookup, credential canary, or missing archive
+object is a release blocker.

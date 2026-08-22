@@ -24,6 +24,11 @@ func TestResolverFingerprintsWithoutRetainingCredential(t *testing.T) {
 	if first.Session != "session" || first.Agent != "agent" || first.ParentAgent != "parent" {
 		t.Fatalf("lineage not captured: %+v", first)
 	}
+	resolver.RecordProfile(first.Principal, Profile{AccountID: "account-123", OrganizationID: "org-456", Email: "person@example.com", DisplayName: "Person", FullName: "Person Example"})
+	profiled := resolver.Resolve(header)
+	if profiled.AccountID != "account-123" || profiled.OrganizationID != "org-456" || profiled.Email != "person@example.com" || profiled.DisplayName != "Person" || profiled.FullName != "Person Example" || profiled.Assurance != "anthropic-oauth-profile" {
+		t.Fatalf("profile mapping missing: %+v", profiled)
+	}
 	header.Set("Authorization", "Bearer another-secret")
 	if resolver.Resolve(header).Principal == first.Principal {
 		t.Fatal("different credentials produced same test fingerprint")

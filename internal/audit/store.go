@@ -19,8 +19,11 @@ type Event struct {
 	Session        string    `json:"session,omitempty"`
 	Agent          string    `json:"agent,omitempty"`
 	ParentAgent    string    `json:"parent_agent,omitempty"`
-	Username       string    `json:"username,omitempty"`
-	Hostname       string    `json:"hostname,omitempty"`
+	AccountID      string    `json:"anthropic_account_id,omitempty"`
+	OrganizationID string    `json:"anthropic_organization_id,omitempty"`
+	Email          string    `json:"anthropic_email,omitempty"`
+	DisplayName    string    `json:"anthropic_display_name,omitempty"`
+	FullName       string    `json:"anthropic_full_name,omitempty"`
 	Assurance      string    `json:"identity_assurance,omitempty"`
 	Route          string    `json:"route,omitempty"`
 	Model          string    `json:"model,omitempty"`

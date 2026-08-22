@@ -31,7 +31,7 @@ func TestPostgresIntegration(t *testing.T) {
 	}
 	defer store.Close()
 	id := "test-" + time.Now().UTC().Format("20060102150405.000000000")
-	event := audit.Event{ID: id, RequestID: id, Type: "identity", Time: time.Now().UTC(), Principal: "principal", Session: "session", Username: "user", Hostname: "host", Assurance: "test", Outcome: "observed"}
+	event := audit.Event{ID: id, RequestID: id, Type: "identity", Time: time.Now().UTC(), Principal: "principal", Session: "session", AccountID: "account", OrganizationID: "organization", Email: "person@example.com", DisplayName: "Person", FullName: "Person Example", Assurance: "test", Outcome: "observed"}
 	if err := store.Append(context.Background(), event); err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +41,7 @@ func TestPostgresIntegration(t *testing.T) {
 	}
 	for _, candidate := range events {
 		if candidate.ID == id {
-			if candidate.Username != "user" || candidate.Hostname != "host" {
+			if candidate.AccountID != "account" || candidate.OrganizationID != "organization" || candidate.Email != "person@example.com" || candidate.DisplayName != "Person" || candidate.FullName != "Person Example" {
 				t.Fatalf("identity projection lost: %+v", candidate)
 			}
 			return

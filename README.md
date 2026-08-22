@@ -25,10 +25,6 @@ In another terminal:
 ANTHROPIC_BASE_URL=http://127.0.0.1:8080 claude
 ```
 
-At the beginning of a session Claude Code runs the read-only identity probe
-`whoami && hostname`. These values are explicitly recorded as trusted pilot
-labels, not cryptographic identity. The first model text then begins with:
-
 ```text
 *** Gaitway Active ***
 ```
@@ -40,6 +36,11 @@ Raw request, response, and tool payloads default to `./data/content`. Audit
 metadata defaults to `./data/audit.jsonl`. The forwarded Claude credential is
 never persisted; only a keyed HMAC fingerprint is retained.
 
+For Claude Code OAuth credentials, Gaitway calls Anthropic's profile endpoint
+once per unseen token fingerprint and records the returned account and
+organization IDs, email, display name, and full name. It never stores the bearer
+token. Persisted audit mappings are restored after a restart.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -48,7 +49,7 @@ never persisted; only a keyed HMAC fingerprint is retained.
 | `GAITWAY_ADMIN_ADDR` | `127.0.0.1:8081` | Read-only, unauthenticated dashboard |
 | `GAITWAY_UPSTREAM_URL` | `https://api.anthropic.com` | Fixed HTTPS Anthropic origin |
 | `GAITWAY_ACTIVATION_MESSAGE` | `*** Gaitway Active ***` | Empty disables the marker |
-| `GAITWAY_IDENTITY_PROBE` | `true` | Run `whoami && hostname` once per session |
+| `GAITWAY_OAUTH_PROFILE` | `true` | Resolve stable Anthropic account and organization IDs once per token fingerprint |
 | `GAITWAY_DATA_DIR` | `./data` | Local keys, audit fallback, and filesystem archive |
 | `DATABASE_URL` | empty | PostgreSQL URL; empty uses JSONL audit metadata |
 | `GAITWAY_ARCHIVE_BACKEND` | `filesystem` | `filesystem` or `s3` |
@@ -66,7 +67,7 @@ never persisted; only a keyed HMAC fingerprint is retained.
 | `GAITWAY_BLOCKED_MODEL_FAMILIES` | `haiku` | Case-insensitive model-name fragments to reject |
 | `GAITWAY_BUDGET_WINDOW` | `4h` | Per-principal usage window |
 | `GAITWAY_BUDGET_WARNING_UNITS` | `0` | Visible acknowledgement threshold; `0` disables |
-| `GAITWAY_BUDGET_HARD_UNITS` | `5000` | Reject the request after recorded usage reaches this token cap; `0` disables |
+| `GAITWAY_BUDGET_HARD_UNITS` | `0` | Reject the request after recorded usage reaches this token cap; `0` disables |
 | `GAITWAY_BUDGET_LIMIT_MESSAGE` | `Gaitway usage limit reached` | Prefix for the limit error; usage, window, and reset time are appended |
 | `GAITWAY_OTEL_ENDPOINT` | empty | OTLP/HTTP base URL; empty disables export |
 | `GAITWAY_TOOLS_ENABLED` | `false` | Enable central tool injection and coordination |

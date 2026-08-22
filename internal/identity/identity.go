@@ -10,31 +10,37 @@ import (
 )
 
 type Resolver struct {
-	key    []byte
-	mu     sync.RWMutex
-	probes map[string]Probe
+	key      []byte
+	mu       sync.RWMutex
+	profiles map[string]Profile
 }
 
-type Probe struct {
-	Username string
-	Hostname string
+type Profile struct {
+	AccountID      string
+	OrganizationID string
+	Email          string
+	DisplayName    string
+	FullName       string
 }
 
 type Identity struct {
-	Principal   string
-	Session     string
-	Agent       string
-	ParentAgent string
-	Username    string
-	Hostname    string
-	Assurance   string
+	Principal      string
+	Session        string
+	Agent          string
+	ParentAgent    string
+	AccountID      string
+	OrganizationID string
+	Email          string
+	DisplayName    string
+	FullName       string
+	Assurance      string
 }
 
 func NewResolver(key []byte) (*Resolver, error) {
 	if len(key) < 32 {
 		return nil, fmt.Errorf("identity HMAC key must contain at least 32 bytes")
 	}
-	return &Resolver{key: append([]byte(nil), key...), probes: make(map[string]Probe)}, nil
+	return &Resolver{key: append([]byte(nil), key...), profiles: make(map[string]Profile)}, nil
 }
 
 func (r *Resolver) Resolve(header http.Header) Identity {
@@ -52,26 +58,34 @@ func (r *Resolver) Resolve(header http.Header) Identity {
 		ParentAgent: boundedHeader(header.Get("x-claude-code-parent-agent-id")),
 	}
 	r.mu.RLock()
-	probe, ok := r.probes[probeKey(identity.Principal, identity.Session)]
+	profile, hasProfile := r.profiles[identity.Principal]
 	r.mu.RUnlock()
-	if ok {
-		identity.Username = probe.Username
-		identity.Hostname = probe.Hostname
-		identity.Assurance = "trusted-pilot-label"
+	if hasProfile {
+		identity.AccountID = profile.AccountID
+		identity.OrganizationID = profile.OrganizationID
+		identity.Email = profile.Email
+		identity.DisplayName = profile.DisplayName
+		identity.FullName = profile.FullName
+		identity.Assurance = "anthropic-oauth-profile"
 	}
 	return identity
 }
 
-func (r *Resolver) RecordProbe(principal, session, username, hostname string) {
-	if principal == "" || session == "" {
+func (r *Resolver) RecordProfile(principal string, profile Profile) {
+	if principal == "" || profile.AccountID == "" || profile.OrganizationID == "" {
 		return
 	}
 	r.mu.Lock()
-	r.probes[probeKey(principal, session)] = Probe{Username: username, Hostname: hostname}
+	r.profiles[principal] = profile
 	r.mu.Unlock()
 }
 
-func probeKey(principal, session string) string { return principal + "\x00" + session }
+func (r *Resolver) HasProfile(principal string) bool {
+	r.mu.RLock()
+	_, ok := r.profiles[principal]
+	r.mu.RUnlock()
+	return ok
+}
 
 func boundedHeader(value string) string {
 	if len(value) > 256 {

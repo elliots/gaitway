@@ -26,12 +26,15 @@ type Service struct {
 	archive   archive.Store
 	audit     audit.Store
 	identity  *identity.Resolver
+	profiles  *identity.ProfileLookup
 	policies  *plugin.Engine
 	maxBody   int64
 	telemetry Telemetry
 	ackMu     sync.Mutex
 	acks      map[string]ackState
 }
+
+func (s *Service) SetProfileLookup(profiles *identity.ProfileLookup) { s.profiles = profiles }
 
 type ackState struct {
 	marker  string
@@ -71,11 +74,17 @@ func (s *Service) Prepare(writer http.ResponseWriter, request *http.Request) (*h
 		return request, false
 	}
 	request.Body = io.NopCloser(bytes.NewReader(body))
+	if s.profiles != nil {
+		if err := s.profiles.Enrich(request.Context(), request.Header); err != nil {
+			writeError(writer, http.StatusServiceUnavailable, "identity_unavailable", "Anthropic identity could not be recorded")
+			return request, false
+		}
+	}
 	identityValue := s.identity.Resolve(request.Header)
 	body, acknowledged, pending := s.consumeAcknowledgement(body, identityValue.Principal, identityValue.Session)
 	if pending && !acknowledged {
 		object, archiveErr := s.archive.Put(request.Context(), "acknowledgement", body)
-		if archiveErr != nil || s.audit.Append(request.Context(), audit.Event{ID: randomID(), RequestID: randomID(), Type: "acknowledgement", Time: time.Now().UTC(), Principal: identityValue.Principal, Session: identityValue.Session, Username: identityValue.Username, Hostname: identityValue.Hostname, Assurance: identityValue.Assurance, Outcome: "required", ContentRef: object.Ref, ContentSHA: object.SHA256, ContentSize: object.Size}) != nil {
+		if archiveErr != nil || s.audit.Append(request.Context(), audit.Event{ID: randomID(), RequestID: randomID(), Type: "acknowledgement", Time: time.Now().UTC(), Principal: identityValue.Principal, Session: identityValue.Session, AccountID: identityValue.AccountID, OrganizationID: identityValue.OrganizationID, Email: identityValue.Email, DisplayName: identityValue.DisplayName, FullName: identityValue.FullName, Assurance: identityValue.Assurance, Outcome: "required", ContentRef: object.Ref, ContentSHA: object.SHA256, ContentSize: object.Size}) != nil {
 			writeError(writer, http.StatusServiceUnavailable, "evidence_unavailable", "acknowledgement evidence could not be recorded")
 			return request, false
 		}
@@ -88,21 +97,21 @@ func (s *Service) Prepare(writer http.ResponseWriter, request *http.Request) (*h
 	id := randomID()
 	decision := s.policies.Evaluate(request.Context(), plugin.Request{ID: id, Principal: identityValue.Principal, Session: identityValue.Session, Route: route, Model: model, Body: body, Now: time.Now().UTC(), Acknowledged: acknowledged})
 	if acknowledged {
-		if s.audit.Append(request.Context(), audit.Event{ID: randomID(), RequestID: id, Type: "acknowledgement", Time: time.Now().UTC(), Principal: identityValue.Principal, Session: identityValue.Session, Username: identityValue.Username, Hostname: identityValue.Hostname, Assurance: identityValue.Assurance, Outcome: "accepted", Policy: "usage-budget"}) != nil {
+		if s.audit.Append(request.Context(), audit.Event{ID: randomID(), RequestID: id, Type: "acknowledgement", Time: time.Now().UTC(), Principal: identityValue.Principal, Session: identityValue.Session, AccountID: identityValue.AccountID, OrganizationID: identityValue.OrganizationID, Email: identityValue.Email, DisplayName: identityValue.DisplayName, FullName: identityValue.FullName, Assurance: identityValue.Assurance, Outcome: "accepted", Policy: "usage-budget"}) != nil {
 			s.policies.Reconcile(identityValue.Principal, id, 0, false, time.Now().UTC())
 			writeError(writer, http.StatusServiceUnavailable, "audit_unavailable", "request audit could not be recorded")
 			return request, false
 		}
 	}
 	for _, finding := range decision.Findings {
-		if s.audit.Append(request.Context(), audit.Event{ID: randomID(), RequestID: id, Type: "policy", Time: time.Now().UTC(), Principal: identityValue.Principal, Session: identityValue.Session, Route: route, Model: model, Policy: finding.Plugin, Rule: finding.Rule, Finding: finding.Masked}) != nil {
+		if s.audit.Append(request.Context(), audit.Event{ID: randomID(), RequestID: id, Type: "policy", Time: time.Now().UTC(), Principal: identityValue.Principal, Session: identityValue.Session, AccountID: identityValue.AccountID, OrganizationID: identityValue.OrganizationID, Email: identityValue.Email, DisplayName: identityValue.DisplayName, FullName: identityValue.FullName, Route: route, Model: model, Policy: finding.Plugin, Rule: finding.Rule, Finding: finding.Masked}) != nil {
 			s.policies.Reconcile(identityValue.Principal, id, 0, false, time.Now().UTC())
 			writeError(writer, http.StatusServiceUnavailable, "audit_unavailable", "policy audit could not be recorded")
 			return request, false
 		}
 	}
 	if decision.Action == plugin.Reject {
-		if s.audit.Append(request.Context(), audit.Event{ID: randomID(), RequestID: id, Type: "request", Time: time.Now().UTC(), Principal: identityValue.Principal, Session: identityValue.Session, Agent: identityValue.Agent, ParentAgent: identityValue.ParentAgent, Username: identityValue.Username, Hostname: identityValue.Hostname, Assurance: identityValue.Assurance, Route: route, Model: model, Outcome: "rejected", Policy: decision.Code}) != nil {
+		if s.audit.Append(request.Context(), audit.Event{ID: randomID(), RequestID: id, Type: "request", Time: time.Now().UTC(), Principal: identityValue.Principal, Session: identityValue.Session, Agent: identityValue.Agent, ParentAgent: identityValue.ParentAgent, AccountID: identityValue.AccountID, OrganizationID: identityValue.OrganizationID, Email: identityValue.Email, DisplayName: identityValue.DisplayName, FullName: identityValue.FullName, Assurance: identityValue.Assurance, Route: route, Model: model, Outcome: "rejected", Policy: decision.Code}) != nil {
 			writeError(writer, http.StatusServiceUnavailable, "audit_unavailable", "rejection audit could not be recorded")
 			return request, false
 		}
@@ -121,7 +130,7 @@ func (s *Service) Prepare(writer http.ResponseWriter, request *http.Request) (*h
 			return request, false
 		}
 		state := ackState{marker: randomID(), message: decision.Message}
-		if s.audit.Append(request.Context(), audit.Event{ID: randomID(), RequestID: id, Type: "request", Time: time.Now().UTC(), Principal: identityValue.Principal, Session: identityValue.Session, Agent: identityValue.Agent, ParentAgent: identityValue.ParentAgent, Username: identityValue.Username, Hostname: identityValue.Hostname, Assurance: identityValue.Assurance, Route: route, Model: model, Outcome: "warning", ContentRef: object.Ref, ContentSHA: object.SHA256, ContentSize: object.Size, Policy: decision.Code}) != nil {
+		if s.audit.Append(request.Context(), audit.Event{ID: randomID(), RequestID: id, Type: "request", Time: time.Now().UTC(), Principal: identityValue.Principal, Session: identityValue.Session, Agent: identityValue.Agent, ParentAgent: identityValue.ParentAgent, AccountID: identityValue.AccountID, OrganizationID: identityValue.OrganizationID, Email: identityValue.Email, DisplayName: identityValue.DisplayName, FullName: identityValue.FullName, Assurance: identityValue.Assurance, Route: route, Model: model, Outcome: "warning", ContentRef: object.Ref, ContentSHA: object.SHA256, ContentSize: object.Size, Policy: decision.Code}) != nil {
 			writeError(writer, http.StatusServiceUnavailable, "audit_unavailable", "warning audit could not be recorded")
 			return request, false
 		}
@@ -140,7 +149,7 @@ func (s *Service) Prepare(writer http.ResponseWriter, request *http.Request) (*h
 		started: time.Now().UTC(), requestRef: object,
 		activationEligible: activationEligible(body),
 	}
-	if s.audit.Append(request.Context(), audit.Event{ID: randomID(), RequestID: id, Type: "request", Time: tx.started, Principal: identityValue.Principal, Session: identityValue.Session, Agent: identityValue.Agent, ParentAgent: identityValue.ParentAgent, Username: identityValue.Username, Hostname: identityValue.Hostname, Assurance: identityValue.Assurance, Route: route, Model: model, Outcome: string(decision.Action), ContentRef: object.Ref, ContentSHA: object.SHA256, ContentSize: object.Size, Policy: decision.Code}) != nil {
+	if s.audit.Append(request.Context(), audit.Event{ID: randomID(), RequestID: id, Type: "request", Time: tx.started, Principal: identityValue.Principal, Session: identityValue.Session, Agent: identityValue.Agent, ParentAgent: identityValue.ParentAgent, AccountID: identityValue.AccountID, OrganizationID: identityValue.OrganizationID, Email: identityValue.Email, DisplayName: identityValue.DisplayName, FullName: identityValue.FullName, Assurance: identityValue.Assurance, Route: route, Model: model, Outcome: string(decision.Action), ContentRef: object.Ref, ContentSHA: object.SHA256, ContentSize: object.Size, Policy: decision.Code}) != nil {
 		s.policies.Reconcile(identityValue.Principal, id, 0, false, time.Now().UTC())
 		writeError(writer, http.StatusServiceUnavailable, "audit_unavailable", "request audit could not be recorded")
 		return request, false
@@ -255,7 +264,7 @@ func (s *Service) writeWarning(writer http.ResponseWriter, request *http.Request
 	}
 	identityValue := s.identity.Resolve(request.Header)
 	object, archiveErr := s.archive.Put(context.WithoutCancel(request.Context()), "response", encoded)
-	if archiveErr != nil || s.audit.Append(context.WithoutCancel(request.Context()), audit.Event{ID: randomID(), RequestID: randomID(), Type: "response", Time: time.Now().UTC(), Principal: identityValue.Principal, Session: identityValue.Session, Username: identityValue.Username, Hostname: identityValue.Hostname, Assurance: identityValue.Assurance, Route: "messages", Model: model, Status: http.StatusOK, Outcome: "warning", ContentRef: object.Ref, ContentSHA: object.SHA256, ContentSize: object.Size, Policy: "usage_warning"}) != nil {
+	if archiveErr != nil || s.audit.Append(context.WithoutCancel(request.Context()), audit.Event{ID: randomID(), RequestID: randomID(), Type: "response", Time: time.Now().UTC(), Principal: identityValue.Principal, Session: identityValue.Session, AccountID: identityValue.AccountID, OrganizationID: identityValue.OrganizationID, Email: identityValue.Email, DisplayName: identityValue.DisplayName, FullName: identityValue.FullName, Assurance: identityValue.Assurance, Route: "messages", Model: model, Status: http.StatusOK, Outcome: "warning", ContentRef: object.Ref, ContentSHA: object.SHA256, ContentSize: object.Size, Policy: "usage_warning"}) != nil {
 		writeError(writer, http.StatusServiceUnavailable, "evidence_unavailable", "warning response could not be recorded")
 		return
 	}
@@ -362,7 +371,8 @@ func (s *Service) RecordTool(ctx context.Context, name, toolUseID string, input 
 	return s.audit.Append(context.WithoutCancel(ctx), audit.Event{
 		ID: randomID(), RequestID: tx.id, Type: "tool", Time: time.Now().UTC(), Principal: tx.identity.Principal,
 		Session: tx.identity.Session, Agent: tx.identity.Agent, ParentAgent: tx.identity.ParentAgent,
-		Username: tx.identity.Username, Hostname: tx.identity.Hostname, Assurance: tx.identity.Assurance,
+		Assurance: tx.identity.Assurance, AccountID: tx.identity.AccountID, OrganizationID: tx.identity.OrganizationID,
+		Email: tx.identity.Email, DisplayName: tx.identity.DisplayName, FullName: tx.identity.FullName,
 		Route: tx.route, Model: tx.model, Outcome: outcome, Status: result.Status, LatencyMS: duration.Milliseconds(),
 		ToolName: name, ToolUseID: toolUseID, Classification: result.Classification,
 		ContentRef: object.Ref, ContentSHA: object.SHA256, ContentSize: object.Size,
@@ -385,7 +395,8 @@ func (s *Service) finish(ctx context.Context, tx *transaction, status int, outco
 		_ = s.audit.Append(context.WithoutCancel(ctx), audit.Event{
 			ID: randomID(), RequestID: tx.id, Type: "response", Time: time.Now().UTC(), Principal: tx.identity.Principal,
 			Session: tx.identity.Session, Agent: tx.identity.Agent, ParentAgent: tx.identity.ParentAgent,
-			Username: tx.identity.Username, Hostname: tx.identity.Hostname, Assurance: tx.identity.Assurance, Route: tx.route,
+			AccountID: tx.identity.AccountID, OrganizationID: tx.identity.OrganizationID,
+			Email: tx.identity.Email, DisplayName: tx.identity.DisplayName, FullName: tx.identity.FullName, Assurance: tx.identity.Assurance, Route: tx.route,
 			Model: tx.model, Status: status, Outcome: outcome, InputTokens: usage.Input, OutputTokens: usage.Output,
 			CacheRead: usage.CacheRead, CacheWrite: usage.CacheWrite, LatencyMS: latency.Milliseconds(),
 			ContentRef: object.Ref, ContentSHA: object.SHA256, ContentSize: object.Size,
