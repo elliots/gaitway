@@ -53,13 +53,11 @@ func TestBudgetAllowsConcurrentRequestsBeforeRecordedLimit(t *testing.T) {
 	var allowed atomic.Int32
 	var group sync.WaitGroup
 	for range 20 {
-		group.Add(1)
-		go func() {
-			defer group.Done()
-			if policy.Evaluate(context.Background(), Request{Principal: "p", Route: "messages", Body: []byte(strings.Repeat("x", 36)), Now: now}).Action == Allow {
+		group.Go(func() {
+			if policy.Evaluate(t.Context(), Request{Principal: "p", Route: "messages", Body: []byte(strings.Repeat("x", 36)), Now: now}).Action == Allow {
 				allowed.Add(1)
 			}
-		}()
+		})
 	}
 	group.Wait()
 	if allowed.Load() != 20 {
@@ -129,5 +127,24 @@ func TestBudgetAcknowledgementLastsForWindow(t *testing.T) {
 	first.Acknowledged = false
 	if decision := policy.Evaluate(context.Background(), first); decision.Action != Allow {
 		t.Fatalf("acknowledgement did not last for window: %+v", decision)
+	}
+}
+
+func TestBudgetPrincipalStateIsBoundedAndPrunesExpiredWindows(t *testing.T) {
+	policy := NewBudgetPolicy(time.Hour, 0, 1_000, "")
+	policy.maxPrincipals = 1
+	now := time.Now()
+	request := Request{ID: "one", Principal: "first", Route: "messages", Body: []byte("x"), Now: now}
+	if decision := policy.Evaluate(t.Context(), request); decision.Action != Allow {
+		t.Fatalf("first principal was rejected: %+v", decision)
+	}
+	request.ID = "two"
+	request.Principal = "second"
+	if decision := policy.Evaluate(t.Context(), request); decision.Code != "usage_capacity" || decision.Status != http.StatusServiceUnavailable {
+		t.Fatalf("principal capacity did not fail closed: %+v", decision)
+	}
+	request.Now = now.Add(time.Hour + 1)
+	if decision := policy.Evaluate(t.Context(), request); decision.Action != Allow {
+		t.Fatalf("expired principal window was not pruned: %+v", decision)
 	}
 }

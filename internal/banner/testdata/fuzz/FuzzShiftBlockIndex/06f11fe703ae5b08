@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("0\ndata:{\"type\":\"content_block_\",\"index\":0000")

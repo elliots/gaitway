@@ -41,7 +41,7 @@ func TestStreamingMessagesPassesThroughAndActivatesOnce(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	gateway := newTestGateway(t, upstream.URL, "*** Gaitway Active ***")
+	gateway := newTestGateway(t, upstream.URL, "Gaitway Active")
 	defer gateway.Close()
 
 	for run := range 2 {
@@ -55,7 +55,7 @@ func TestStreamingMessagesPassesThroughAndActivatesOnce(t *testing.T) {
 		}
 		body, _ := io.ReadAll(response.Body)
 		_ = response.Body.Close()
-		count := strings.Count(string(body), `"text":"*** Gaitway Active ***\n\n"`)
+		count := strings.Count(string(body), `"text":"> **Gaitway Active**"}`)
 		if run == 0 && count != 1 {
 			t.Fatalf("first response marker count %d: %s", count, body)
 		}
@@ -105,7 +105,7 @@ func TestHiddenMetadataRequestCannotConsumeActivation(t *testing.T) {
 		}
 		body, _ := io.ReadAll(response.Body)
 		_ = response.Body.Close()
-		count := strings.Count(string(body), `"text":"active\n\n"`)
+		count := strings.Count(string(body), `"text":"> **active**"}`)
 		want := 0
 		if index == 1 {
 			want = 1

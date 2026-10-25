@@ -1,7 +1,6 @@
 package dashboard
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -15,7 +14,7 @@ import (
 
 func TestDashboardEscapesDataAndWarnsAboutAuth(t *testing.T) {
 	server, events, _ := testServer(t)
-	_ = events.Append(context.Background(), audit.Event{ID: "1", Type: "request", Time: time.Now(), Email: "person@example.com", FullName: "Person Example", Model: `<script>alert(1)</script>`, Outcome: "allow"})
+	_ = events.Append(t.Context(), audit.Event{ID: "1", Type: "request", Time: time.Now(), Email: "person@example.com", FullName: "Person Example", Model: `<script>alert(1)</script>`, Outcome: "allow"})
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, request)
@@ -30,7 +29,7 @@ func TestDashboardEscapesDataAndWarnsAboutAuth(t *testing.T) {
 
 func TestRawContentIsInertAndAudited(t *testing.T) {
 	server, events, objects := testServer(t)
-	object, _ := objects.Put(context.Background(), "response", []byte(`<script>alert(1)</script>`))
+	object, _ := objects.Put(t.Context(), "response", []byte(`<script>alert(1)</script>`))
 	request := httptest.NewRequest(http.MethodGet, "/api/content/"+object.Ref, nil)
 	request.SetPathValue("ref", object.Ref)
 	response := httptest.NewRecorder()
@@ -38,7 +37,7 @@ func TestRawContentIsInertAndAudited(t *testing.T) {
 	if response.Header().Get("Content-Type") != "text/plain; charset=utf-8" || response.Body.String() != `<script>alert(1)</script>` {
 		t.Fatal("raw content was not rendered inertly")
 	}
-	listed, _ := events.List(context.Background(), 10)
+	listed, _ := events.List(t.Context(), 10)
 	if len(listed) != 1 || listed[0].Type != "raw_access" {
 		t.Fatalf("raw access not audited: %+v", listed)
 	}

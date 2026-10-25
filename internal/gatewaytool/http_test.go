@@ -1,7 +1,6 @@
 package gatewaytool
 
 import (
-	"context"
 	"crypto/x509"
 	"encoding/json"
 	"net/http"
@@ -30,15 +29,15 @@ func TestHTTPToolUsesAllowlistAndBounds(t *testing.T) {
 	if err := tool.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	result := tool.Execute(context.Background(), json.RawMessage(`{"url":"`+server.URL+`/api/data"}`))
+	result := tool.Execute(t.Context(), json.RawMessage(`{"url":"`+server.URL+`/api/data"}`))
 	if !result.IsError || result.Classification != "truncated" || len(result.Content) != 20 {
 		t.Fatalf("unexpected bounded result: %+v", result)
 	}
-	blocked := tool.Execute(context.Background(), json.RawMessage(`{"url":"https://example.com/api/data"}`))
+	blocked := tool.Execute(t.Context(), json.RawMessage(`{"url":"https://example.com/api/data"}`))
 	if !blocked.IsError || blocked.Classification != "policy" {
 		t.Fatalf("unapproved host was not blocked: %+v", blocked)
 	}
-	lookalike := tool.Execute(context.Background(), json.RawMessage(`{"url":"`+server.URL+`/apievil"}`))
+	lookalike := tool.Execute(t.Context(), json.RawMessage(`{"url":"`+server.URL+`/apievil"}`))
 	if !lookalike.IsError || lookalike.Classification != "policy" {
 		t.Fatalf("path-prefix lookalike was not blocked: %+v", lookalike)
 	}

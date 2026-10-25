@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -29,7 +30,7 @@ import (
 	"gaitway/internal/telemetry"
 )
 
-const defaultActivation = "*** Gaitway Active ***"
+const defaultActivation = "Gaitway Active"
 
 type config struct {
 	listenAddr       string
@@ -42,6 +43,8 @@ type config struct {
 	maxSSEFrameBytes int
 	dataDir          string
 	secretAction     plugin.Action
+	cardAction       plugin.Action
+	testCards        []string
 	approvedModels   []string
 	blockedModels    []string
 	budgetWindow     time.Duration
@@ -73,22 +76,26 @@ type config struct {
 
 func main() {
 	localLogs := slog.NewJSONHandler(os.Stderr, nil)
-	logger := slog.New(localLogs)
+	if err := run(localLogs); err != nil {
+		slog.New(localLogs).Error("gaitway stopped", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run(localLogs slog.Handler) (runErr error) {
 	settings, err := loadConfig()
 	if err != nil {
-		logger.Error("invalid configuration", "error", err)
-		os.Exit(2)
+		return fmt.Errorf("invalid configuration: %w", err)
 	}
 	telemetryRecorder, telemetryLogger, shutdownTelemetry, err := telemetry.New(context.Background(), settings.otelEndpoint, localLogs)
 	if err != nil {
-		logger.Error("cannot configure telemetry", "error", err)
-		os.Exit(2)
+		return fmt.Errorf("configure telemetry: %w", err)
 	}
-	logger = telemetryLogger
+	logger := telemetryLogger
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = shutdownTelemetry(ctx)
+		runErr = errors.Join(runErr, shutdownTelemetry(ctx))
 	}()
 
 	registry := banner.NewRegistry(settings.maxSessions)
@@ -104,24 +111,21 @@ func main() {
 		objects, err = archive.NewFilesystem(filepath.Join(settings.dataDir, "content"))
 	}
 	if err != nil {
-		logger.Error("cannot open content archive", "error", err)
-		os.Exit(2)
+		return fmt.Errorf("open content archive: %w", err)
 	}
 	var events audit.Store
 	var closeEvents func()
 	if settings.databaseURL != "" {
 		postgresEvents, openErr := postgresstore.New(context.Background(), settings.databaseURL)
 		if openErr != nil {
-			logger.Error("cannot open postgres audit store", "error", openErr)
-			os.Exit(2)
+			return fmt.Errorf("open postgres audit store: %w", openErr)
 		}
 		events = postgresEvents
 		closeEvents = postgresEvents.Close
 	} else {
 		fileEvents, openErr := audit.NewJSONLStore(filepath.Join(settings.dataDir, "audit.jsonl"))
 		if openErr != nil {
-			logger.Error("cannot open audit store", "error", openErr)
-			os.Exit(2)
+			return fmt.Errorf("open audit store: %w", openErr)
 		}
 		events = fileEvents
 		closeEvents = func() {}
@@ -129,43 +133,40 @@ func main() {
 	defer closeEvents()
 	identityKey, err := loadOrCreateKey(filepath.Join(settings.dataDir, "identity-hmac.key"))
 	if err != nil {
-		logger.Error("cannot load identity key", "error", err)
-		os.Exit(2)
+		return fmt.Errorf("load identity key: %w", err)
 	}
 	resolver, err := identity.NewResolver(identityKey)
 	if err != nil {
-		logger.Error("cannot create identity resolver", "error", err)
-		os.Exit(2)
+		return fmt.Errorf("create identity resolver: %w", err)
 	}
 	if err := restoreProfiles(context.Background(), events, resolver); err != nil {
-		logger.Error("cannot restore Anthropic identity mappings", "error", err)
-		os.Exit(2)
+		return fmt.Errorf("restore Anthropic identity mappings: %w", err)
 	}
 	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+	defer baseTransport.CloseIdleConnections()
 	baseTransport.DisableCompression = true
 	baseTransport.DisableKeepAlives = true
 	policies, err := plugin.NewEngine(100*time.Millisecond,
 		plugin.NewSecretScanner(settings.secretAction),
+		plugin.NewCardScanner(settings.cardAction, settings.testCards),
 		plugin.NewModelPolicy(settings.approvedModels, settings.blockedModels),
 		plugin.NewBudgetPolicy(settings.budgetWindow, settings.budgetWarning, settings.budgetHard, settings.budgetMessage),
 	)
 	if err != nil {
-		logger.Error("cannot create policy engine", "error", err)
-		os.Exit(2)
+		return fmt.Errorf("create policy engine: %w", err)
 	}
 	controller := control.NewService(objects, events, resolver, policies, settings.maxRequestBytes, telemetryRecorder)
+	controller.SetBanner(transformer)
 	if settings.oauthProfile {
 		profiles, profileErr := identity.NewProfileLookup(settings.upstream, baseTransport, resolver, events)
 		if profileErr != nil {
-			logger.Error("cannot create Anthropic identity lookup", "error", profileErr)
-			os.Exit(2)
+			return fmt.Errorf("create Anthropic identity lookup: %w", profileErr)
 		}
 		controller.SetProfileLookup(profiles)
 	}
 	admin, err := dashboard.New(events, objects)
 	if err != nil {
-		logger.Error("cannot create dashboard", "error", err)
-		os.Exit(2)
+		return fmt.Errorf("create dashboard: %w", err)
 	}
 	var upstreamTransport http.RoundTripper = baseTransport
 	if settings.toolsEnabled {
@@ -175,25 +176,21 @@ func main() {
 		})
 		toolRegistry, registryErr := gatewaytool.NewRegistry(httpTool)
 		if registryErr != nil {
-			logger.Error("cannot register gateway tools", "error", registryErr)
-			os.Exit(2)
+			return fmt.Errorf("register gateway tools: %w", registryErr)
 		}
 		toolKey, keyErr := loadOrCreateKey(filepath.Join(settings.dataDir, "gateway-tool-hmac.key"))
 		if keyErr != nil {
-			logger.Error("cannot load gateway tool fingerprint key", "error", keyErr)
-			os.Exit(2)
+			return fmt.Errorf("load gateway tool fingerprint key: %w", keyErr)
 		}
 		toolFingerprinter, fingerprintErr := gatewaytool.NewFingerprinter(toolKey)
 		if fingerprintErr != nil {
-			logger.Error("cannot create gateway tool fingerprinter", "error", fingerprintErr)
-			os.Exit(2)
+			return fmt.Errorf("create gateway tool fingerprinter: %w", fingerprintErr)
 		}
 		coordinator, coordinatorErr := gatewaytool.NewCoordinator(gatewaytool.CoordinatorConfig{
 			Next: upstreamTransport, Registry: toolRegistry, Fingerprinter: toolFingerprinter, MaxBody: settings.maxRequestBytes, Observer: controller,
 		})
 		if coordinatorErr != nil {
-			logger.Error("cannot create gateway tool coordinator", "error", coordinatorErr)
-			os.Exit(2)
+			return fmt.Errorf("create gateway tool coordinator: %w", coordinatorErr)
 		}
 		upstreamTransport = coordinator
 	}
@@ -207,15 +204,14 @@ func main() {
 		Hooks:           controller,
 	})
 	if err != nil {
-		logger.Error("cannot create gateway", "error", err)
-		os.Exit(2)
+		return fmt.Errorf("create gateway: %w", err)
 	}
 
 	listener, err := net.Listen("tcp", settings.listenAddr)
 	if err != nil {
-		logger.Error("cannot listen", "error", err)
-		os.Exit(2)
+		return fmt.Errorf("listen for gateway: %w", err)
 	}
+	defer listener.Close()
 	server := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -228,32 +224,33 @@ func main() {
 	}
 	adminListener, err := net.Listen("tcp", settings.adminAddr)
 	if err != nil {
-		_ = listener.Close()
-		logger.Error("cannot listen for dashboard", "error", err)
-		os.Exit(2)
+		return fmt.Errorf("listen for dashboard: %w", err)
 	}
+	defer adminListener.Close()
 	logger.Info("gaitway ready", "address", listener.Addr().String(), "activation", settings.activation != "")
 	logger.Warn("dashboard has no application authentication", "address", adminListener.Addr().String())
 
 	stopping, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go func() {
-		<-stopping.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_ = server.Shutdown(ctx)
-		_ = adminServer.Shutdown(ctx)
-	}()
-	go func() {
-		if err := adminServer.Serve(adminListener); err != nil && err != http.ErrServerClosed {
-			logger.Error("dashboard stopped unexpectedly", "error", err)
-			stop()
+	serveErrors := make(chan error, 2)
+	serve := func(name string, server *http.Server, listener net.Listener) {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErrors <- fmt.Errorf("serve %s: %w", name, err)
 		}
-	}()
-	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
-		logger.Error("gateway stopped unexpectedly", "error", err)
-		os.Exit(1)
 	}
+	go serve("gateway", server, listener)
+	go serve("dashboard", adminServer, adminListener)
+
+	var serveErr error
+	select {
+	case <-stopping.Done():
+	case serveErr = <-serveErrors:
+		stop()
+	}
+	shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	shutdownErr := errors.Join(server.Shutdown(shutdownContext), adminServer.Shutdown(shutdownContext))
+	return errors.Join(serveErr, shutdownErr)
 }
 
 func loadConfig() (config, error) {
@@ -266,6 +263,8 @@ func loadConfig() (config, error) {
 		maxSSEFrameBytes: 8 << 20,
 		dataDir:          envOr("GAITWAY_DATA_DIR", "./data"),
 		secretAction:     plugin.Action(envOr("GAITWAY_SECRET_ACTION", "reject")),
+		cardAction:       plugin.Action(envOr("GAITWAY_CARD_ACTION", "redact")),
+		testCards:        plugin.DefaultTestCards,
 		approvedModels:   splitList(os.Getenv("GAITWAY_APPROVED_MODELS")),
 		blockedModels:    splitList(envOr("GAITWAY_BLOCKED_MODEL_FAMILIES", "haiku")),
 		budgetWindow:     4 * time.Hour,
@@ -304,6 +303,9 @@ func loadConfig() (config, error) {
 	if result.oauthProfile, boolErr = envBool("GAITWAY_OAUTH_PROFILE", true); boolErr != nil {
 		return config{}, boolErr
 	}
+	if raw, exists := os.LookupEnv("GAITWAY_CARD_TEST_NUMBERS"); exists {
+		result.testCards = splitList(raw)
+	}
 	if result.archiveBackend != "filesystem" && result.archiveBackend != "s3" {
 		return config{}, fmt.Errorf("GAITWAY_ARCHIVE_BACKEND must be filesystem or s3")
 	}
@@ -319,19 +321,8 @@ func loadConfig() (config, error) {
 	}
 	result.upstream = upstream
 
-	numbers := []struct {
-		name   string
-		target *int64
-		value  int64
-	}{
-		{"GAITWAY_MAX_REQUEST_BYTES", &result.maxRequestBytes, result.maxRequestBytes},
-	}
-	for _, number := range numbers {
-		parsed, err := positiveInt64(number.name, number.value)
-		if err != nil {
-			return config{}, err
-		}
-		*number.target = parsed
+	if result.maxRequestBytes, err = positiveInt64("GAITWAY_MAX_REQUEST_BYTES", result.maxRequestBytes); err != nil {
+		return config{}, err
 	}
 	var intErr error
 	if result.maxSessionBytes, intErr = positiveInt("GAITWAY_MAX_SESSION_ID_BYTES", result.maxSessionBytes); intErr != nil {
@@ -406,7 +397,7 @@ func nonNegativeInt64(name string, fallback int64) (int64, error) {
 
 func splitList(raw string) []string {
 	var result []string
-	for _, item := range strings.Split(raw, ",") {
+	for item := range strings.SplitSeq(raw, ",") {
 		if item = strings.TrimSpace(item); item != "" {
 			result = append(result, item)
 		}
@@ -445,7 +436,7 @@ func envBool(name string, fallback bool) (bool, error) {
 func loadOrCreateKey(path string) ([]byte, error) {
 	if key, err := os.ReadFile(path); err == nil {
 		return key, nil
-	} else if !os.IsNotExist(err) {
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

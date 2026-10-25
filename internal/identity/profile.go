@@ -3,10 +3,10 @@ package identity
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
@@ -16,20 +16,28 @@ import (
 	"gaitway/internal/audit"
 )
 
-const maxProfileResponseBytes = 64 << 10
+const (
+	maxProfileResponseBytes = 64 << 10
+	defaultMaxAttempts      = 10_000
+	defaultNegativeTTL      = 5 * time.Minute
+)
 
 type ProfileLookup struct {
-	client   *http.Client
-	endpoint string
-	resolver *Resolver
-	events   audit.Store
-	mu       sync.Mutex
-	attempts map[string]*profileAttempt
+	client      *http.Client
+	endpoint    string
+	resolver    *Resolver
+	events      audit.Store
+	mu          sync.Mutex
+	attempts    map[string]*profileAttempt
+	maxAttempts int
+	negativeTTL time.Duration
+	now         func() time.Time
 }
 
 type profileAttempt struct {
-	done chan struct{}
-	err  error
+	done      chan struct{}
+	err       error
+	expiresAt time.Time
 }
 
 func NewProfileLookup(upstream *url.URL, transport http.RoundTripper, resolver *Resolver, events audit.Store) (*ProfileLookup, error) {
@@ -45,6 +53,7 @@ func NewProfileLookup(upstream *url.URL, transport http.RoundTripper, resolver *
 			return http.ErrUseLastResponse
 		}},
 		endpoint: endpoint.String(), resolver: resolver, events: events, attempts: make(map[string]*profileAttempt),
+		maxAttempts: defaultMaxAttempts, negativeTTL: defaultNegativeTTL, now: time.Now,
 	}, nil
 }
 
@@ -59,22 +68,43 @@ func (l *ProfileLookup) Enrich(ctx context.Context, header http.Header) error {
 	}
 
 	l.mu.Lock()
+	now := l.now()
 	if attempt, exists := l.attempts[identity.Principal]; exists {
-		l.mu.Unlock()
-		select {
-		case <-attempt.done:
-			return attempt.err
-		case <-ctx.Done():
-			return ctx.Err()
+		if attempt.expiresAt.IsZero() || attempt.expiresAt.After(now) {
+			l.mu.Unlock()
+			select {
+			case <-attempt.done:
+				return attempt.err
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		delete(l.attempts, identity.Principal)
+	}
+	if len(l.attempts) >= l.maxAttempts {
+		maps.DeleteFunc(l.attempts, func(_ string, attempt *profileAttempt) bool {
+			return !attempt.expiresAt.IsZero() && !attempt.expiresAt.After(now)
+		})
+		if len(l.attempts) >= l.maxAttempts {
+			l.mu.Unlock()
+			return fmt.Errorf("profile lookup capacity reached")
 		}
 	}
 	attempt := &profileAttempt{done: make(chan struct{})}
 	l.attempts[identity.Principal] = attempt
 	l.mu.Unlock()
 
-	attempt.err = l.lookup(ctx, authorization, identity)
+	err := l.lookup(ctx, authorization, identity)
+	l.mu.Lock()
+	attempt.err = err
+	if err != nil || l.resolver.HasProfile(identity.Principal) || l.negativeTTL <= 0 {
+		delete(l.attempts, identity.Principal)
+	} else {
+		attempt.expiresAt = l.now().Add(l.negativeTTL)
+	}
 	close(attempt.done)
-	return attempt.err
+	l.mu.Unlock()
+	return err
 }
 
 func (l *ProfileLookup) lookup(ctx context.Context, authorization string, identity Identity) error {
@@ -134,11 +164,7 @@ func (l *ProfileLookup) record(ctx context.Context, identity Identity, profile P
 }
 
 func randomProfileID() string {
-	buffer := make([]byte, 16)
-	if _, err := rand.Read(buffer); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
-	}
-	return hex.EncodeToString(buffer)
+	return rand.Text()
 }
 
 func boundedProfileText(value string, limit int) string {

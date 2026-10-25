@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -23,6 +24,9 @@ type Request struct {
 	Body         []byte
 	Now          time.Time
 	Acknowledged bool
+	// Background marks an invisible Claude Code request, such as session
+	// title generation, whose errors are never shown to the user.
+	Background bool
 }
 
 type UsageReconciler interface {
@@ -42,6 +46,11 @@ type Decision struct {
 	Code     string
 	Message  string
 	Findings []Finding
+	// Body replaces the request body for later plugins and upstream; nil
+	// leaves it unchanged.
+	Body []byte
+	// Notices are sentences shown to the user at the start of the response.
+	Notices []string
 }
 
 type RequestPlugin interface {
@@ -67,15 +76,20 @@ func NewEngine(timeout time.Duration, plugins ...RequestPlugin) (*Engine, error)
 			return nil, fmt.Errorf("plugin %s: %w", item.Name(), err)
 		}
 	}
-	return &Engine{timeout: timeout, plugins: append([]RequestPlugin(nil), plugins...)}, nil
+	return &Engine{timeout: timeout, plugins: slices.Clone(plugins)}, nil
 }
 
 func (e *Engine) Evaluate(ctx context.Context, request Request) Decision {
 	combined := Decision{Action: Allow}
-	request.Body = append([]byte(nil), request.Body...)
+	request.Body = slices.Clone(request.Body)
 	for _, item := range e.plugins {
 		decision := e.evaluateOne(ctx, item, request)
 		combined.Findings = append(combined.Findings, decision.Findings...)
+		combined.Notices = append(combined.Notices, decision.Notices...)
+		if decision.Body != nil {
+			request.Body = decision.Body
+			combined.Body = decision.Body
+		}
 		if decision.Action == Reject {
 			decision.Findings = combined.Findings
 			return decision

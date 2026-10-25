@@ -6,7 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -41,19 +42,31 @@ type Tool interface {
 }
 
 type Registry struct {
-	tools map[string]Tool
-	names []string
-	mu    sync.Mutex
-	runs  map[string]*toolRun
+	tools   map[string]Tool
+	names   []string
+	mu      sync.Mutex
+	runs    map[string]*toolRun
+	maxRuns int
+	runTTL  time.Duration
+	now     func() time.Time
 }
 
 type toolRun struct {
-	done   chan struct{}
-	result Result
+	done      chan struct{}
+	result    Result
+	expiresAt time.Time
 }
 
+const (
+	defaultMaxToolRuns = 10_000
+	defaultToolRunTTL  = 10 * time.Minute
+)
+
 func NewRegistry(tools ...Tool) (*Registry, error) {
-	registry := &Registry{tools: make(map[string]Tool), runs: make(map[string]*toolRun)}
+	registry := &Registry{
+		tools: make(map[string]Tool), runs: make(map[string]*toolRun),
+		maxRuns: defaultMaxToolRuns, runTTL: defaultToolRunTTL, now: time.Now,
+	}
 	for _, tool := range tools {
 		if tool == nil {
 			return nil, fmt.Errorf("nil gateway tool")
@@ -74,7 +87,7 @@ func NewRegistry(tools ...Tool) (*Registry, error) {
 		registry.tools[descriptor.Name] = tool
 		registry.names = append(registry.names, descriptor.Name)
 	}
-	sort.Strings(registry.names)
+	slices.Sort(registry.names)
 	return registry, nil
 }
 
@@ -82,7 +95,7 @@ func (r *Registry) Descriptors() []Descriptor {
 	result := make([]Descriptor, 0, len(r.names))
 	for _, name := range r.names {
 		descriptor := r.tools[name].Descriptor()
-		descriptor.InputSchema = append(json.RawMessage(nil), descriptor.InputSchema...)
+		descriptor.InputSchema = slices.Clone(descriptor.InputSchema)
 		result = append(result, descriptor)
 	}
 	return result
@@ -91,12 +104,6 @@ func (r *Registry) Descriptors() []Descriptor {
 func (r *Registry) Contains(name string) bool {
 	_, ok := r.tools[name]
 	return ok
-}
-
-// Start begins a replay-safe execution without delaying the caller. A later
-// Execute with the same inputs waits for and reuses this result.
-func (r *Registry) Start(name, idempotencyKey string, input json.RawMessage) {
-	go r.Execute(context.Background(), name, idempotencyKey, input)
 }
 
 func (r *Registry) Execute(ctx context.Context, name, idempotencyKey string, input json.RawMessage) Result {
@@ -110,13 +117,26 @@ func (r *Registry) Execute(ctx context.Context, name, idempotencyKey string, inp
 	digest := sha256.Sum256(append([]byte(name+"\x00"+idempotencyKey+"\x00"), input...))
 	key := hex.EncodeToString(digest[:])
 	r.mu.Lock()
+	now := r.now()
 	if existing, ok := r.runs[key]; ok {
-		r.mu.Unlock()
-		select {
-		case <-existing.done:
-			return existing.result
-		case <-ctx.Done():
-			return Result{Content: "gateway tool request was cancelled", IsError: true, Classification: "internal"}
+		if existing.expiresAt.IsZero() || existing.expiresAt.After(now) {
+			r.mu.Unlock()
+			select {
+			case <-existing.done:
+				return existing.result
+			case <-ctx.Done():
+				return Result{Content: "gateway tool request was cancelled", IsError: true, Classification: "internal"}
+			}
+		}
+		delete(r.runs, key)
+	}
+	if len(r.runs) >= r.maxRuns {
+		maps.DeleteFunc(r.runs, func(_ string, run *toolRun) bool {
+			return !run.expiresAt.IsZero() && !run.expiresAt.After(now)
+		})
+		if len(r.runs) >= r.maxRuns {
+			r.mu.Unlock()
+			return Result{Content: "gateway tool execution capacity reached", IsError: true, Classification: "capacity"}
 		}
 	}
 	run := &toolRun{done: make(chan struct{})}
@@ -133,7 +153,7 @@ func (r *Registry) Execute(ctx context.Context, name, idempotencyKey string, inp
 				resultChannel <- Result{Content: "gateway tool failed", IsError: true, Classification: "internal"}
 			}
 		}()
-		resultChannel <- tool.Execute(toolContext, append(json.RawMessage(nil), input...))
+		resultChannel <- tool.Execute(toolContext, slices.Clone(input))
 	}()
 	var result Result
 	select {
@@ -148,6 +168,7 @@ func (r *Registry) Execute(ctx context.Context, name, idempotencyKey string, inp
 	}
 	r.mu.Lock()
 	run.result = result
+	run.expiresAt = r.now().Add(r.runTTL)
 	close(run.done)
 	r.mu.Unlock()
 	return result

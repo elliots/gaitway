@@ -11,13 +11,11 @@ func TestRegistryClaimsOnce(t *testing.T) {
 	var winners atomic.Int32
 	var group sync.WaitGroup
 	for range 50 {
-		group.Add(1)
-		go func() {
-			defer group.Done()
+		group.Go(func() {
 			if registry.Claim("session") {
 				winners.Add(1)
 			}
-		}()
+		})
 	}
 	group.Wait()
 	if winners.Load() != 1 {

@@ -3,7 +3,8 @@ package plugin
 import (
 	"context"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 )
 
@@ -53,11 +54,7 @@ func (p *ModelPolicy) Evaluate(_ context.Context, request Request) Decision {
 	if _, ok := p.allowed[request.Model]; ok {
 		return Decision{Action: Allow}
 	}
-	models := make([]string, 0, len(p.allowed))
-	for model := range p.allowed {
-		models = append(models, model)
-	}
-	sort.Strings(models)
+	models := slices.Sorted(maps.Keys(p.allowed))
 	return Decision{
 		Action:   Reject,
 		Status:   403,

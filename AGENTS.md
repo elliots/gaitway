@@ -24,10 +24,6 @@ The first release is a production-quality pilot for a small cohort inside one en
 - **Data**: Retain all permissible raw traffic in v1 — explicit prohibited-data exclusions are still mandatory, and formal compliance hardening is deferred.
 - **Testing**: Cost-capped live Claude Code end-to-end tests are a mandatory release gate — mocks alone cannot validate client compatibility or tool-history behavior.
 
-<!-- GSD:project-end -->
-
-<!-- GSD:stack-start source:research/STACK.md -->
-
 ## Technology Stack
 
 ## Executive Recommendation
@@ -386,24 +382,3 @@ No project skills found. Add skills to any of: `.claude/skills/`, `.agents/skill
 <!-- GSD:skills-end -->
 
 <!-- GSD:workflow-start source:GSD defaults -->
-
-## GSD Workflow Enforcement
-
-Before using Edit, Write, or other file-changing tools, start work through a GSD command so planning artifacts and execution context stay in sync.
-
-Use these entry points:
-
-- `/gsd-quick` for small fixes, doc updates, and ad-hoc tasks
-- `/gsd-debug` for investigation and bug fixing
-- `/gsd-execute-phase` for planned phase work
-
-Do not make direct repo edits outside a GSD workflow unless the user explicitly asks to bypass it.
-<!-- GSD:workflow-end -->
-
-<!-- GSD:profile-start -->
-
-## Developer Profile
-
-> Profile not yet configured. Run `/gsd-profile-user` to generate your developer profile.
-> This section is managed by `generate-claude-profile` -- do not edit manually.
-<!-- GSD:profile-end -->

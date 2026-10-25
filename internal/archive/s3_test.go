@@ -1,7 +1,6 @@
 package archive
 
 import (
-	"context"
 	"os"
 	"testing"
 )
@@ -11,18 +10,18 @@ func TestS3Integration(t *testing.T) {
 	if endpoint == "" {
 		t.Skip("set GAITWAY_TEST_S3_ENDPOINT to run the S3-compatible archive test")
 	}
-	store, err := NewS3(context.Background(), S3Config{
+	store, err := NewS3(t.Context(), S3Config{
 		Endpoint: endpoint, Bucket: "gaitway-test", AccessKey: "gaitway-local", SecretKey: "gaitway-local-secret",
 		AllowHTTP: true, CreateBucket: true, Prefix: "integration",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	written, err := store.Put(context.Background(), "request", []byte("s3 archive payload"))
+	written, err := store.Put(t.Context(), "request", []byte("s3 archive payload"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	read, err := store.Read(context.Background(), written.Ref)
+	read, err := store.Read(t.Context(), written.Ref)
 	if err != nil {
 		t.Fatal(err)
 	}

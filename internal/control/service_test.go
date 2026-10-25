@@ -2,6 +2,7 @@ package control
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -25,6 +26,16 @@ import (
 )
 
 type failingAudit struct{}
+
+type closeTrackingBody struct {
+	io.Reader
+	closed bool
+}
+
+func (b *closeTrackingBody) Close() error {
+	b.closed = true
+	return nil
+}
 
 func (failingAudit) Append(context.Context, audit.Event) error {
 	return errors.New("audit unavailable")
@@ -119,9 +130,163 @@ func TestServiceRejectsSecretWithoutArchivingBody(t *testing.T) {
 	if ok || response.Code != 422 {
 		t.Fatalf("secret request not rejected: %d", response.Code)
 	}
-	matches, _ := filepath.Glob(filepath.Join(root, "content", "*", "*", "*", "*.bin"))
+	matches, _ := filepath.Glob(filepath.Join(root, "content", "*", "*", "*.bin"))
 	if len(matches) != 0 {
 		t.Fatal("prohibited request body was archived")
+	}
+}
+
+func TestServiceForwardsAndArchivesRedactedCard(t *testing.T) {
+	root := t.TempDir()
+	objects, _ := archive.NewFilesystem(filepath.Join(root, "content"))
+	events, _ := audit.NewJSONLStore(filepath.Join(root, "audit.jsonl"))
+	resolver, _ := identity.NewResolver([]byte(strings.Repeat("k", 32)))
+	policies, _ := plugin.NewEngine(time.Second, plugin.NewCardScanner(plugin.Redact, nil))
+	service := NewService(objects, events, resolver, policies, 1<<20)
+	send := func() (*http.Request, *httptest.ResponseRecorder, bool) {
+		request := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"message":"4539148803436467"}`))
+		request.Header.Set("x-claude-code-session-id", "session")
+		response := httptest.NewRecorder()
+		prepared, ok := service.Prepare(response, request)
+		return prepared, response, ok
+	}
+	prepared, _, ok := send()
+	if !ok {
+		t.Fatal("card request rejected")
+	}
+	forwarded, _ := io.ReadAll(prepared.Body)
+	if string(forwarded) != `{"message":"[REDACTED: real card number ending 6467]"}` || prepared.ContentLength != int64(len(forwarded)) {
+		t.Fatalf("forwarded body not masked: %q length=%d", forwarded, prepared.ContentLength)
+	}
+	matches, _ := filepath.Glob(filepath.Join(root, "content", "*", "*", "*.bin"))
+	for _, match := range matches {
+		if contents, _ := os.ReadFile(match); bytes.Contains(contents, []byte("4539148803436467")) {
+			t.Fatal("unmasked card was archived")
+		}
+	}
+	if len(matches) == 0 {
+		t.Fatal("masked request was not archived")
+	}
+}
+
+func TestCardRedactionNoticeReachesUser(t *testing.T) {
+	root := t.TempDir()
+	objects, _ := archive.NewFilesystem(filepath.Join(root, "content"))
+	events, _ := audit.NewJSONLStore(filepath.Join(root, "audit.jsonl"))
+	resolver, _ := identity.NewResolver([]byte(strings.Repeat("k", 32)))
+	policies, _ := plugin.NewEngine(time.Second, plugin.NewCardScanner(plugin.Redact, nil))
+	controller := NewService(objects, events, resolver, policies, 1<<20)
+
+	responses := []string{
+		`{"content":[{"type":"tool_use","id":"t","name":"Read","input":{}}],"usage":{"input_tokens":1,"output_tokens":1}}`,
+		`{"content":[{"type":"text","text":"OK"}],"usage":{"input_tokens":1,"output_tokens":1}}`,
+		`{"content":[{"type":"text","text":"OK"}],"usage":{"input_tokens":1,"output_tokens":1}}`,
+	}
+	var forwarded []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, _ := io.ReadAll(request.Body)
+		forwarded = append(forwarded, string(body))
+		writer.Header().Set("Content-Type", "application/json")
+		// Claude Code accepts gzip, and Anthropic uses it when allowed.
+		if strings.Contains(request.Header.Get("Accept-Encoding"), "gzip") {
+			writer.Header().Set("Content-Encoding", "gzip")
+			compressed := gzip.NewWriter(writer)
+			_, _ = io.WriteString(compressed, responses[len(forwarded)-1])
+			_ = compressed.Close()
+			return
+		}
+		_, _ = io.WriteString(writer, responses[len(forwarded)-1])
+	}))
+	defer upstream.Close()
+	upstreamURL, _ := url.Parse(upstream.URL)
+	transformer := banner.NewTransformer("", banner.NewRegistry(10), 1<<20, 8<<20)
+	controller.SetBanner(transformer)
+	handler, err := proxy.NewHandler(proxy.Config{
+		Upstream: upstreamURL,
+		Banner:   transformer,
+		Hooks:    controller,
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway := httptest.NewServer(handler)
+	defer gateway.Close()
+	send := func(messages string) (int, string) {
+		body := `{"model":"claude-test","messages":[` + messages + `]}`
+		request, _ := http.NewRequest(http.MethodPost, gateway.URL+"/v1/messages", strings.NewReader(body))
+		request.Header.Set("x-claude-code-session-id", "session")
+		request.Header.Set("Accept-Encoding", "gzip")
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		reader := io.Reader(response.Body)
+		if response.Header.Get("Content-Encoding") == "gzip" {
+			if reader, err = gzip.NewReader(response.Body); err != nil {
+				t.Fatal(err)
+			}
+		}
+		text, _ := io.ReadAll(reader)
+		return response.StatusCode, string(text)
+	}
+
+	notice := `{"type":"text","text":"> **⚠ Gaitway:** ` + "`Credit card number ending in 6467 was redacted before sending to the model`" + `"}`
+	first := `{"role":"user","content":"card 4539148803436467"}`
+	// The notice is its own first block, so even a tool-only reply carries it.
+	if status, body := send(first); status != 200 || !strings.HasPrefix(body, `{"content":[`+notice+`,{"type":"tool_use"`) {
+		t.Fatalf("notice missing from tool response: %d %s", status, body)
+	}
+	// History replays the annotated reply, as Claude Code does; the card is
+	// no longer in the newest message, so nothing is announced.
+	history := first + `,{"role":"assistant","content":[` + notice + `,{"type":"text","text":"OK"}]}`
+	if _, body := send(history + `,{"role":"user","content":"next"}`); strings.Contains(body, "Gaitway") {
+		t.Fatalf("history-only card announced: %s", body)
+	}
+	if _, body := send(history + `,{"role":"user","content":"again 4539148803436467"}`); !strings.Contains(body, notice) {
+		t.Fatalf("repeated card not announced: %s", body)
+	}
+	for _, body := range forwarded {
+		if strings.Contains(body, "4539148803436467") || !strings.Contains(body, "[REDACTED: real card number ending 6467]") {
+			t.Fatalf("card not redacted upstream: %s", body)
+		}
+		if strings.Contains(body, "Gaitway") {
+			t.Fatalf("injected notice sent upstream: %s", body)
+		}
+	}
+}
+
+func TestServiceClosesConsumedRequestBody(t *testing.T) {
+	service := &Service{maxBody: 1}
+	body := &closeTrackingBody{Reader: strings.NewReader(`{}`)}
+	request := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	request.Body = body
+	response := httptest.NewRecorder()
+	if _, ok := service.Prepare(response, request); ok || response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized request was not rejected: status=%d", response.Code)
+	}
+	if !body.closed {
+		t.Fatal("consumed request body was not closed")
+	}
+}
+
+func TestAcknowledgementStateIsBoundedAndExpires(t *testing.T) {
+	service := &Service{
+		acks: make(map[string]ackState), maxAcks: 1,
+		ackTTL: time.Minute, now: time.Now,
+	}
+	now := time.Now()
+	service.now = func() time.Time { return now }
+	if !service.rememberAcknowledgement("first", ackState{marker: "one"}) {
+		t.Fatal("first acknowledgement was rejected")
+	}
+	if service.rememberAcknowledgement("second", ackState{marker: "two"}) {
+		t.Fatal("acknowledgement state exceeded its capacity")
+	}
+	now = now.Add(time.Minute + 1)
+	if !service.rememberAcknowledgement("second", ackState{marker: "two"}) {
+		t.Fatal("expired acknowledgement did not release capacity")
 	}
 }
 

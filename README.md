@@ -26,7 +26,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8080 claude
 ```
 
 ```text
-*** Gaitway Active ***
+> **Claude Gateway Active**
 ```
 
 The dashboard is at <http://127.0.0.1:8081>. It has no application
@@ -48,7 +48,7 @@ token. Persisted audit mappings are restored after a restart.
 | `GAITWAY_LISTEN_ADDR` | `127.0.0.1:8080` | Claude API listen address |
 | `GAITWAY_ADMIN_ADDR` | `127.0.0.1:8081` | Read-only, unauthenticated dashboard |
 | `GAITWAY_UPSTREAM_URL` | `https://api.anthropic.com` | Fixed HTTPS Anthropic origin |
-| `GAITWAY_ACTIVATION_MESSAGE` | `*** Gaitway Active ***` | Empty disables the marker |
+| `GAITWAY_ACTIVATION_MESSAGE` | `Claude Gateway Active` | Shown once per session as a bold quote (`> **message**`); empty disables the marker |
 | `GAITWAY_OAUTH_PROFILE` | `true` | Resolve stable Anthropic account and organization IDs once per token fingerprint |
 | `GAITWAY_DATA_DIR` | `./data` | Local keys, audit fallback, and filesystem archive |
 | `DATABASE_URL` | empty | PostgreSQL URL; empty uses JSONL audit metadata |
@@ -63,6 +63,8 @@ token. Persisted audit mappings are restored after a restart.
 | `GAITWAY_S3_ALLOW_HTTP` | `false` | Permit plain HTTP for local MinIO only |
 | `GAITWAY_S3_CREATE_BUCKET` | `false` | Create a missing bucket at startup |
 | `GAITWAY_SECRET_ACTION` | `reject` | `reject` or `allow` detected secret patterns |
+| `GAITWAY_CARD_ACTION` | `redact` | Luhn-valid payment card numbers: `redact` forwards every request with each card replaced by `[REDACTED: real card number ending 1234]` and shows the user a notice whenever the newest message contains one; `reject` blocks the request; `allow` records only |
+| `GAITWAY_CARD_TEST_NUMBERS` | common processor test cards | Comma-separated card numbers that are never flagged; replaces the default list, empty disables it |
 | `GAITWAY_APPROVED_MODELS` | empty | Comma-separated exact Claude model allowlist |
 | `GAITWAY_BLOCKED_MODEL_FAMILIES` | `haiku` | Case-insensitive model-name fragments to reject |
 | `GAITWAY_BUDGET_WINDOW` | `4h` | Per-principal usage window |

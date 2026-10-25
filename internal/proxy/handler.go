@@ -34,6 +34,13 @@ type activationEligibility interface {
 	ActivationEligible(*http.Request) bool
 }
 
+// responseNotices supplies text to show the user at the start of the
+// response; done reports whether it was written.
+type responseNotices interface {
+	NoticePending(*http.Request) bool
+	ResponseNotice(*http.Request) (text string, done func(emitted bool))
+}
+
 type claimKey struct{}
 
 func NewHandler(config Config) (http.Handler, error) {
@@ -61,19 +68,35 @@ func NewHandler(config Config) (http.Handler, error) {
 			request.SetURL(config.Upstream)
 			request.Out.URL.RawQuery = request.In.URL.RawQuery
 			request.Out.GetBody = nil
-			// The activation seam cannot safely mutate a compressed body. Ask the
-			// upstream for identity encoding only on the one claimed response;
-			// passive requests retain the client's original encoding negotiation.
-			if claim, _ := request.In.Context().Value(claimKey{}).(string); claim != "" {
+			// The activation and notice seams cannot safely mutate a compressed
+			// body. Ask the upstream for identity encoding only on responses that
+			// will be annotated; passive requests retain the client's original
+			// encoding negotiation.
+			claim, _ := request.In.Context().Value(claimKey{}).(string)
+			notices, _ := config.Hooks.(responseNotices)
+			if claim != "" || (notices != nil && notices.NoticePending(request.In)) {
 				request.Out.Header.Del("Accept-Encoding")
 			}
 		},
 		Transport:     config.Transport,
 		FlushInterval: -1,
 		ModifyResponse: func(response *http.Response) error {
+			// Notices are inserted first so the activation block, inserted at
+			// index 0 after them, stays on top.
+			if notices, ok := config.Hooks.(responseNotices); ok {
+				if text, done := notices.ResponseNotice(response.Request); text != "" {
+					if response.Header.Get("X-Gaitway-Defer-Activation") == "1" {
+						done(false)
+					} else if _, err := config.Banner.InsertBlock(response, text, done); err != nil {
+						return err
+					}
+				}
+			}
 			claim, _ := response.Request.Context().Value(claimKey{}).(string)
 			if claim != "" {
-				config.Banner.TransformResponse(response, claim)
+				if _, err := config.Banner.TransformResponse(response, claim); err != nil {
+					return err
+				}
 			}
 			// Never expose coordinator-only response metadata to clients, including
 			// sessions whose activation marker was already emitted.

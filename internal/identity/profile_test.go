@@ -1,7 +1,6 @@
 package identity
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"gaitway/internal/audit"
 )
@@ -38,11 +38,11 @@ func TestProfileLookupRunsOncePerTokenAndStoresProfileWithoutToken(t *testing.T)
 	header := make(http.Header)
 	header.Set("Authorization", "Bearer token-one")
 	header.Set("x-claude-code-session-id", "session-one")
-	if err := lookup.Enrich(context.Background(), header); err != nil {
+	if err := lookup.Enrich(t.Context(), header); err != nil {
 		t.Fatal(err)
 	}
 	header.Set("x-claude-code-session-id", "session-two")
-	if err := lookup.Enrich(context.Background(), header); err != nil {
+	if err := lookup.Enrich(t.Context(), header); err != nil {
 		t.Fatal(err)
 	}
 	identity := resolver.Resolve(header)
@@ -54,13 +54,13 @@ func TestProfileLookupRunsOncePerTokenAndStoresProfileWithoutToken(t *testing.T)
 	}
 
 	header.Set("Authorization", "Bearer token-two")
-	if err := lookup.Enrich(context.Background(), header); err != nil {
+	if err := lookup.Enrich(t.Context(), header); err != nil {
 		t.Fatal(err)
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("second token did not get its own lookup: %d", calls.Load())
 	}
-	recorded, _ := events.List(context.Background(), 10)
+	recorded, _ := events.List(t.Context(), 10)
 	encoded, _ := json.Marshal(recorded)
 	if len(recorded) != 2 || !strings.Contains(string(encoded), "private@example.com") || !strings.Contains(string(encoded), "Private Person") || strings.Contains(string(encoded), "token-one") {
 		t.Fatalf("unsafe profile evidence: %s", encoded)
@@ -87,15 +87,13 @@ func TestProfileLookupCoalescesConcurrentRequestsForOneToken(t *testing.T) {
 	start := make(chan struct{})
 	errors := make(chan error, workers)
 	var group sync.WaitGroup
-	for index := 0; index < workers; index++ {
-		group.Add(1)
-		go func() {
-			defer group.Done()
+	for range workers {
+		group.Go(func() {
 			<-start
 			header := make(http.Header)
 			header.Set("Authorization", "Bearer shared-token")
-			errors <- lookup.Enrich(context.Background(), header)
-		}()
+			errors <- lookup.Enrich(t.Context(), header)
+		})
 	}
 	close(start)
 	group.Wait()
@@ -107,5 +105,52 @@ func TestProfileLookupCoalescesConcurrentRequestsForOneToken(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("profile endpoint called %d times for concurrent requests", calls.Load())
+	}
+}
+
+func TestProfileLookupExpiresNegativeResult(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		writer.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	upstream, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := NewResolver([]byte(strings.Repeat("k", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := audit.NewJSONLStore(filepath.Join(t.TempDir(), "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookup, err := NewProfileLookup(upstream, nil, resolver, events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	lookup.now = func() time.Time { return now }
+	lookup.negativeTTL = time.Minute
+	header := http.Header{"Authorization": {"Bearer unavailable-token"}}
+
+	if err := lookup.Enrich(t.Context(), header); err != nil {
+		t.Fatal(err)
+	}
+	if err := lookup.Enrich(t.Context(), header); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("negative result was not cached: %d calls", calls.Load())
+	}
+	now = now.Add(time.Minute + 1)
+	if err := lookup.Enrich(t.Context(), header); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expired negative result was not retried: %d calls", calls.Load())
 	}
 }

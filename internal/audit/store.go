@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 )
@@ -113,9 +114,7 @@ func (s *JSONLStore) List(ctx context.Context, limit int) ([]Event, error) {
 		}
 		result = append(result, event)
 	}
-	for left, right := 0, len(result)-1; left < right; left, right = left+1, right-1 {
-		result[left], result[right] = result[right], result[left]
-	}
+	slices.Reverse(result)
 	return result, nil
 }
 

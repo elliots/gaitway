@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +34,7 @@ type Coordinator struct {
 	fingerprinter *Fingerprinter
 	maxLoops      int
 	maxBody       int64
+	maxConcurrent int
 	observer      Observer
 	pending       map[string]pendingMixed
 	pendingMu     sync.Mutex
@@ -49,12 +52,13 @@ type Observer interface {
 }
 
 type CoordinatorConfig struct {
-	Next          http.RoundTripper
-	Registry      *Registry
-	Fingerprinter *Fingerprinter
-	MaxLoops      int
-	MaxBody       int64
-	Observer      Observer
+	Next           http.RoundTripper
+	Registry       *Registry
+	Fingerprinter  *Fingerprinter
+	MaxLoops       int
+	MaxBody        int64
+	MaxConcurrency int
+	Observer       Observer
 }
 
 func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
@@ -70,9 +74,12 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 	if config.MaxBody <= 0 {
 		config.MaxBody = 32 << 20
 	}
+	if config.MaxConcurrency <= 0 {
+		config.MaxConcurrency = 4
+	}
 	return &Coordinator{
 		next: config.Next, registry: config.Registry, fingerprinter: config.Fingerprinter,
-		maxLoops: config.MaxLoops, maxBody: config.MaxBody, observer: config.Observer,
+		maxLoops: config.MaxLoops, maxBody: config.MaxBody, maxConcurrent: config.MaxConcurrency, observer: config.Observer,
 		pending: make(map[string]pendingMixed),
 	}, nil
 }
@@ -81,8 +88,16 @@ func (c *Coordinator) RoundTrip(request *http.Request) (*http.Response, error) {
 	if request.Method != http.MethodPost || (request.URL.Path != "/v1/messages" && request.URL.Path != "/v1/messages/count_tokens") {
 		return c.next.RoundTrip(request)
 	}
-	body, err := io.ReadAll(io.LimitReader(request.Body, c.maxBody+1))
-	if err != nil || int64(len(body)) > c.maxBody {
+	requestBody := io.Reader(http.NoBody)
+	if request.Body != nil {
+		defer request.Body.Close()
+		requestBody = request.Body
+	}
+	body, err := io.ReadAll(io.LimitReader(requestBody, c.maxBody+1))
+	if err != nil {
+		return nil, fmt.Errorf("read tool-enabled request: %w", err)
+	}
+	if int64(len(body)) > c.maxBody {
 		return localError(request, http.StatusRequestEntityTooLarge, "request_too_large", "tool-enabled request exceeds gateway limit"), nil
 	}
 	var payload map[string]json.RawMessage
@@ -118,9 +133,12 @@ func (c *Coordinator) RoundTrip(request *http.Request) (*http.Response, error) {
 			return response, roundTripErr
 		}
 		responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, c.maxBody+1))
-		_ = response.Body.Close()
-		if readErr != nil || int64(len(responseBody)) > c.maxBody {
-			return nil, fmt.Errorf("read tool-enabled upstream response: %w", readErr)
+		closeErr := response.Body.Close()
+		if readErr != nil || closeErr != nil {
+			return nil, fmt.Errorf("read tool-enabled upstream response: %w", errors.Join(readErr, closeErr))
+		}
+		if int64(len(responseBody)) > c.maxBody {
+			return nil, fmt.Errorf("tool-enabled upstream response exceeds %d bytes", c.maxBody)
 		}
 		message, err := decodeUpstreamMessage(responseBody)
 		if err != nil {
@@ -141,9 +159,6 @@ func (c *Coordinator) RoundTrip(request *http.Request) (*http.Response, error) {
 			message["usage"], _ = json.Marshal(usageTotals)
 			if err := c.rememberMixed(principal, session, message["content"], calls, blocks); err != nil {
 				return localError(request, http.StatusBadRequest, "mixed_tool_state", err.Error()), nil
-			}
-			for _, call := range calls {
-				c.registry.Start(call.name, call.id, call.input)
 			}
 			if err := c.rewriteMixed(blocks, message); err != nil {
 				return nil, err
@@ -253,11 +268,7 @@ func decodeMessageSSE(body []byte) (map[string]json.RawMessage, error) {
 	if message == nil {
 		return nil, fmt.Errorf("stream contained no message_start event")
 	}
-	indexes := make([]int, 0, len(blocks))
-	for index := range blocks {
-		indexes = append(indexes, index)
-	}
-	sort.Ints(indexes)
+	indexes := slices.Sorted(maps.Keys(blocks))
 	content := make([]map[string]json.RawMessage, 0, len(indexes))
 	for _, index := range indexes {
 		block := blocks[index]
@@ -276,7 +287,7 @@ func decodeMessageSSE(body []byte) (map[string]json.RawMessage, error) {
 
 func sseData(frame []byte) []byte {
 	var result []byte
-	for _, line := range bytes.Split(frame, []byte("\n")) {
+	for line := range bytes.SplitSeq(frame, []byte("\n")) {
 		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
@@ -306,9 +317,7 @@ func mergeJSONObjects(base, update json.RawMessage) json.RawMessage {
 	}
 	var additions map[string]json.RawMessage
 	if json.Unmarshal(update, &additions) == nil {
-		for name, value := range additions {
-			result[name] = value
-		}
+		maps.Copy(result, additions)
 	}
 	encoded, _ := json.Marshal(result)
 	return encoded
@@ -332,27 +341,39 @@ func (c *Coordinator) partition(blocks []map[string]json.RawMessage) ([]toolCall
 			hasLocal = true
 			continue
 		}
-		calls = append(calls, toolCall{id: rawString(block["id"]), name: name, input: append(json.RawMessage(nil), block["input"]...)})
+		calls = append(calls, toolCall{id: rawString(block["id"]), name: name, input: slices.Clone(block["input"])})
 	}
 	return calls, hasLocal
 }
 
 func (c *Coordinator) executeAll(ctx context.Context, calls []toolCall) []ToolResult {
 	results := make([]ToolResult, len(calls))
-	done := make(chan int, len(calls))
-	for index, call := range calls {
-		go func() {
-			started := time.Now()
-			results[index] = ToolResult{ToolUseID: call.id, ToolName: call.name, Result: c.registry.Execute(ctx, call.name, call.id, call.input)}
-			if err := c.record(ctx, call.input, results[index], time.Since(started)); err != nil {
-				results[index].Result = Result{Content: "gateway tool evidence could not be recorded", IsError: true, Classification: "internal"}
+	type job struct {
+		index int
+		call  toolCall
+	}
+	jobs := make(chan job)
+	var group sync.WaitGroup
+	for range min(c.maxConcurrent, len(calls)) {
+		group.Go(func() {
+			for next := range jobs {
+				started := time.Now()
+				results[next.index] = ToolResult{
+					ToolUseID: next.call.id,
+					ToolName:  next.call.name,
+					Result:    c.registry.Execute(ctx, next.call.name, next.call.id, next.call.input),
+				}
+				if err := c.record(ctx, next.call.input, results[next.index], time.Since(started)); err != nil {
+					results[next.index].Result = Result{Content: "gateway tool evidence could not be recorded", IsError: true, Classification: "internal"}
+				}
 			}
-			done <- index
-		}()
+		})
 	}
-	for range calls {
-		<-done
+	for index, call := range calls {
+		jobs <- job{index: index, call: call}
 	}
+	close(jobs)
+	group.Wait()
 	return results
 }
 
@@ -392,25 +413,26 @@ func (c *Coordinator) rememberMixed(principal, session string, assistantContent 
 	clonedCalls := make([]toolCall, len(calls))
 	for index, call := range calls {
 		clonedCalls[index] = call
-		clonedCalls[index].input = append(json.RawMessage(nil), call.input...)
+		clonedCalls[index].input = slices.Clone(call.input)
 	}
 	key := pendingKey(principal, session)
 	now := time.Now()
 	c.pendingMu.Lock()
 	defer c.pendingMu.Unlock()
-	for candidate, state := range c.pending {
-		if !state.expiresAt.After(now) {
-			delete(c.pending, candidate)
+	if state, exists := c.pending[key]; exists {
+		if state.expiresAt.After(now) {
+			return fmt.Errorf("session already has a pending mixed-tool turn")
 		}
-	}
-	if _, exists := c.pending[key]; exists {
-		return fmt.Errorf("session already has a pending mixed-tool turn")
+		delete(c.pending, key)
 	}
 	if len(c.pending) >= pendingMixedLimit {
-		return fmt.Errorf("pending mixed-tool capacity reached")
+		maps.DeleteFunc(c.pending, func(_ string, state pendingMixed) bool { return !state.expiresAt.After(now) })
+		if len(c.pending) >= pendingMixedLimit {
+			return fmt.Errorf("pending mixed-tool capacity reached")
+		}
 	}
 	c.pending[key] = pendingMixed{
-		assistantContent: append(json.RawMessage(nil), assistantContent...),
+		assistantContent: slices.Clone(assistantContent),
 		calls:            clonedCalls,
 		localToolIDs:     localToolIDs,
 		expiresAt:        now.Add(pendingMixedTTL),
@@ -433,7 +455,7 @@ func (c *Coordinator) findPending(principal, session string, messages []map[stri
 	if !exists {
 		return pendingMixed{}, -1
 	}
-	for index := len(messages) - 1; index >= 0; index-- {
+	for index := range slices.Backward(messages) {
 		if rawString(messages[index]["role"]) == "assistant" && matchesLocalTools(messages[index]["content"], state.localToolIDs) {
 			return state, index
 		}
@@ -517,7 +539,7 @@ func (c *Coordinator) normalizeHistory(ctx context.Context, principal, session s
 			continue
 		}
 		if messageIndex == pendingIndex {
-			message["content"] = append(json.RawMessage(nil), pendingState.assistantContent...)
+			message["content"] = slices.Clone(pendingState.assistantContent)
 			normalized = append(normalized, message)
 			pendingResults = c.executeAll(ctx, pendingState.calls)
 			continue
@@ -568,7 +590,7 @@ func stripLegacyReceipts(content json.RawMessage) (json.RawMessage, bool, error)
 
 func (c *Coordinator) record(ctx context.Context, input json.RawMessage, result ToolResult, duration time.Duration) error {
 	if c.observer != nil {
-		return c.observer.RecordTool(ctx, result.ToolName, result.ToolUseID, append(json.RawMessage(nil), input...), result.Result, duration)
+		return c.observer.RecordTool(ctx, result.ToolName, result.ToolUseID, slices.Clone(input), result.Result, duration)
 	}
 	return nil
 }
@@ -620,7 +642,7 @@ func appendToolTurn(payload map[string]json.RawMessage, assistantContent json.Ra
 		return err
 	}
 	messages = append(messages,
-		map[string]json.RawMessage{"role": json.RawMessage(`"assistant"`), "content": append(json.RawMessage(nil), assistantContent...)},
+		map[string]json.RawMessage{"role": json.RawMessage(`"assistant"`), "content": slices.Clone(assistantContent)},
 		toolResultMessage(results),
 	)
 	encoded, err := json.Marshal(messages)
@@ -740,10 +762,7 @@ func messageSSE(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	start := make(map[string]json.RawMessage, len(message))
-	for key, value := range message {
-		start[key] = value
-	}
+	start := maps.Clone(message)
 	start["content"] = json.RawMessage(`[]`)
 	start["stop_reason"] = json.RawMessage(`null`)
 	start["stop_sequence"] = json.RawMessage(`null`)

@@ -3,18 +3,20 @@ package plugin
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net/http"
 	"sync"
 	"time"
 )
 
 type BudgetPolicy struct {
-	mu           sync.Mutex
-	window       time.Duration
-	warning      int64
-	hard         int64
-	limitMessage string
-	usage        map[string]budgetWindow
+	mu            sync.Mutex
+	window        time.Duration
+	warning       int64
+	hard          int64
+	limitMessage  string
+	usage         map[string]budgetWindow
+	maxPrincipals int
 }
 
 type budgetWindow struct {
@@ -29,7 +31,10 @@ func NewBudgetPolicy(window time.Duration, warning, hard int64, limitMessage str
 	if limitMessage == "" {
 		limitMessage = "Gaitway usage limit reached"
 	}
-	return &BudgetPolicy{window: window, warning: warning, hard: hard, limitMessage: limitMessage, usage: make(map[string]budgetWindow)}
+	return &BudgetPolicy{
+		window: window, warning: warning, hard: hard, limitMessage: limitMessage,
+		usage: make(map[string]budgetWindow), maxPrincipals: 10_000,
+	}
 }
 
 func (*BudgetPolicy) Name() string { return "usage-budget" }
@@ -48,8 +53,21 @@ func (b *BudgetPolicy) Evaluate(_ context.Context, request Request) Decision {
 	units := estimatedUnits(request.Body)
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	entry := b.usage[request.Principal]
-	if entry.started.IsZero() || request.Now.Sub(entry.started) >= b.window {
+	entry, exists := b.usage[request.Principal]
+	if exists && request.Now.Sub(entry.started) >= b.window {
+		delete(b.usage, request.Principal)
+		exists = false
+	}
+	if !exists && len(b.usage) >= b.maxPrincipals {
+		maps.DeleteFunc(b.usage, func(_ string, candidate budgetWindow) bool {
+			return request.Now.Sub(candidate.started) >= b.window
+		})
+		if len(b.usage) >= b.maxPrincipals {
+			message := "usage accounting capacity reached"
+			return Decision{Action: Reject, Status: http.StatusServiceUnavailable, Code: "usage_capacity", Message: message, Findings: []Finding{{Plugin: b.Name(), Rule: "capacity", Message: message}}}
+		}
+	}
+	if !exists {
 		entry = budgetWindow{started: request.Now, reservations: make(map[string]int64)}
 	}
 	if entry.used >= b.hard {

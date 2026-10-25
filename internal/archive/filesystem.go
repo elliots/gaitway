@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -47,7 +48,7 @@ func (f *Filesystem) Put(ctx context.Context, kind string, body []byte) (Object,
 	ref := hex.EncodeToString(idBytes)
 	digest := sha256.Sum256(body)
 	created := time.Now().UTC()
-	directory := filepath.Join(f.root, created.Format("2006"), created.Format("01"), created.Format("02"))
+	directory := filepath.Dir(f.objectPath(ref))
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return Object{}, fmt.Errorf("create archive directory: %w", err)
 	}
@@ -72,7 +73,7 @@ func (f *Filesystem) Put(ctx context.Context, kind string, body []byte) (Object,
 	if err := temporary.Close(); err != nil {
 		return Object{}, fmt.Errorf("close archive object: %w", err)
 	}
-	name := filepath.Join(directory, ref+".bin")
+	name := f.objectPath(ref)
 	if err := os.Rename(temporaryName, name); err != nil {
 		return Object{}, fmt.Errorf("publish archive object: %w", err)
 	}
@@ -95,6 +96,20 @@ func (f *Filesystem) Read(ctx context.Context, ref string) ([]byte, error) {
 	if !validRef(ref) {
 		return nil, fmt.Errorf("invalid object reference")
 	}
+	body, err := os.ReadFile(f.objectPath(ref))
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
+		return body, err
+	}
+	return f.readLegacy(ref)
+}
+
+func (f *Filesystem) objectPath(ref string) string {
+	return filepath.Join(f.root, ref[:2], ref[2:4], ref+".bin")
+}
+
+// readLegacy keeps objects written by the earlier date-partitioned layout
+// readable while new objects use a directly addressable sharded path.
+func (f *Filesystem) readLegacy(ref string) ([]byte, error) {
 	var match string
 	err := filepath.WalkDir(f.root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {

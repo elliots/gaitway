@@ -25,16 +25,14 @@ func TestRegistryCoalescesConcurrentExecutions(t *testing.T) {
 	const callers = 20
 	start := make(chan struct{})
 	var group sync.WaitGroup
-	group.Add(callers)
 	for range callers {
-		go func() {
-			defer group.Done()
+		group.Go(func() {
 			<-start
-			result := registry.Execute(context.Background(), "gaitway__test", "same", json.RawMessage(`{"x":1}`))
+			result := registry.Execute(t.Context(), "gaitway__test", "same", json.RawMessage(`{"x":1}`))
 			if result.IsError || result.Content != "ok" {
 				t.Errorf("unexpected result: %+v", result)
 			}
-		}()
+		})
 	}
 	close(start)
 	group.Wait()
@@ -54,13 +52,36 @@ func TestRegistryIsDeterministicAndIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := registry.Execute(context.Background(), "gaitway__test", "id", json.RawMessage(`{"x":1}`))
-	second := registry.Execute(context.Background(), "gaitway__test", "id", json.RawMessage(`{"x":1}`))
+	first := registry.Execute(t.Context(), "gaitway__test", "id", json.RawMessage(`{"x":1}`))
+	second := registry.Execute(t.Context(), "gaitway__test", "id", json.RawMessage(`{"x":1}`))
 	if first != second || tool.calls.Load() != 1 {
 		t.Fatalf("tool was not idempotent: %+v %+v calls=%d", first, second, tool.calls.Load())
 	}
 	if registry.Descriptors()[0].Name != "gaitway__test" {
 		t.Fatal("descriptor ordering changed")
+	}
+}
+
+func TestRegistryBoundsAndExpiresCompletedRuns(t *testing.T) {
+	tool := &testTool{}
+	registry, err := NewRegistry(tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	registry.maxRuns = 1
+	registry.runTTL = time.Minute
+	registry.now = func() time.Time { return now }
+
+	if result := registry.Execute(t.Context(), "gaitway__test", "first", json.RawMessage(`{"x":1}`)); result.IsError {
+		t.Fatalf("first execution failed: %+v", result)
+	}
+	if result := registry.Execute(t.Context(), "gaitway__test", "second", json.RawMessage(`{"x":2}`)); !result.IsError || result.Classification != "capacity" {
+		t.Fatalf("full registry accepted a new execution: %+v", result)
+	}
+	now = now.Add(time.Minute + 1)
+	if result := registry.Execute(t.Context(), "gaitway__test", "second", json.RawMessage(`{"x":2}`)); result.IsError {
+		t.Fatalf("expired execution did not free capacity: %+v", result)
 	}
 }
 

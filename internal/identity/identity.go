@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"slices"
 	"sync"
 )
 
@@ -40,7 +41,7 @@ func NewResolver(key []byte) (*Resolver, error) {
 	if len(key) < 32 {
 		return nil, fmt.Errorf("identity HMAC key must contain at least 32 bytes")
 	}
-	return &Resolver{key: append([]byte(nil), key...), profiles: make(map[string]Profile)}, nil
+	return &Resolver{key: slices.Clone(key), profiles: make(map[string]Profile)}, nil
 }
 
 func (r *Resolver) Resolve(header http.Header) Identity {

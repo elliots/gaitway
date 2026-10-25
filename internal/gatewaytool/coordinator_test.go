@@ -3,11 +3,14 @@ package gatewaytool
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type scriptedTransport struct {
@@ -15,6 +18,38 @@ type scriptedTransport struct {
 	mu      sync.Mutex
 	steps   []func(map[string]json.RawMessage) string
 	request int
+}
+
+type trackingBody struct {
+	io.Reader
+	closed bool
+}
+
+type blockingTool struct {
+	started chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (*blockingTool) Descriptor() Descriptor {
+	return Descriptor{
+		Name: "gaitway__blocking", Description: "test", InputSchema: json.RawMessage(`{"type":"object"}`),
+		Access: "read-only", Timeout: time.Second, MaxResultBytes: 100,
+	}
+}
+
+func (*blockingTool) Validate() error { return nil }
+
+func (t *blockingTool) Execute(context.Context, json.RawMessage) Result {
+	t.calls.Add(1)
+	t.started <- struct{}{}
+	<-t.release
+	return Result{Content: "ok", Classification: "untrusted"}
+}
+
+func (b *trackingBody) Close() error {
+	b.closed = true
+	return nil
 }
 
 func (s *scriptedTransport) RoundTrip(request *http.Request) (*http.Response, error) {
@@ -222,6 +257,71 @@ func TestAccumulateUsageSkipsNestedMetadata(t *testing.T) {
 	}
 }
 
+func TestCoordinatorClosesRejectedRequestBody(t *testing.T) {
+	registry, err := NewRegistry(&testTool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprinter, err := NewFingerprinter([]byte(strings.Repeat("k", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := NewCoordinator(CoordinatorConfig{Registry: registry, Fingerprinter: fingerprinter, MaxBody: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := &trackingBody{Reader: strings.NewReader(`{}`)}
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://api.anthropic.test/v1/messages", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Body = body
+	response, err := coordinator.RoundTrip(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+	if !body.closed {
+		t.Fatal("coordinator did not close the incoming request body")
+	}
+}
+
+func TestCoordinatorBoundsConcurrentToolExecutions(t *testing.T) {
+	tool := &blockingTool{started: make(chan struct{}, 4), release: make(chan struct{})}
+	registry, err := NewRegistry(tool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprinter, err := NewFingerprinter([]byte(strings.Repeat("k", 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := NewCoordinator(CoordinatorConfig{Registry: registry, Fingerprinter: fingerprinter, MaxConcurrency: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := make([]toolCall, 4)
+	for index := range calls {
+		calls[index] = toolCall{id: fmt.Sprintf("call-%d", index), name: "gaitway__blocking", input: json.RawMessage(`{}`)}
+	}
+	done := make(chan []ToolResult, 1)
+	go func() { done <- coordinator.executeAll(t.Context(), calls) }()
+	<-tool.started
+	<-tool.started
+	select {
+	case <-tool.started:
+		close(tool.release)
+		t.Fatal("more than two gateway tools executed concurrently")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(tool.release)
+	if results := <-done; len(results) != len(calls) || tool.calls.Load() != int32(len(calls)) {
+		t.Fatalf("tool batch did not complete: results=%d calls=%d", len(results), tool.calls.Load())
+	}
+}
+
 func TestMixedStateIsBoundToPrincipalAndSession(t *testing.T) {
 	registry, _ := NewRegistry(&testTool{})
 	fingerprinter, _ := NewFingerprinter([]byte(strings.Repeat("p", 32)))
@@ -276,7 +376,7 @@ func assertInjectedTool(t *testing.T, payload map[string]json.RawMessage) {
 
 func newMessagesRequest(t *testing.T, body string) *http.Request {
 	t.Helper()
-	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://api.anthropic.test/v1/messages", strings.NewReader(body))
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://api.anthropic.test/v1/messages", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}

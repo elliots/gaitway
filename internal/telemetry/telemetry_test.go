@@ -1,7 +1,6 @@
 package telemetry
 
 import (
-	"context"
 	"io"
 	"log/slog"
 	"testing"
@@ -9,14 +8,14 @@ import (
 )
 
 func TestDisabledTelemetryIsNoop(t *testing.T) {
-	recorder, logger, shutdown, err := New(context.Background(), "", slog.NewTextHandler(io.Discard, nil))
+	recorder, logger, shutdown, err := New(t.Context(), "", slog.NewTextHandler(io.Discard, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := recorder.Begin(context.Background(), "messages")
+	ctx := recorder.Begin(t.Context(), "messages")
 	recorder.Finish(ctx, "completed", 200, time.Millisecond)
 	logger.Info("safe", "route", "messages")
-	if err := shutdown(context.Background()); err != nil {
+	if err := shutdown(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 }
